@@ -113,28 +113,11 @@ async def send_voice(update: Update, text: str):
                 pass
 
 
-async def addcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin sends card photo.
-    Caption = just a number → bot awaits voice description.
-    Caption = "5: text" → saves immediately.
-    Caption = "back" → sets card back image.
-    """
-    if not is_admin(update):
-        return
-    if not update.message.photo:
-        await update.message.reply_text(
-            "Пришли фото карты с номером в подписи, например: <code>5</code>\n"
-            "Потом я попрошу продиктовать описание голосом.",
-            parse_mode="HTML",
-        )
-        return
+async def _save_card_image(update: Update, context: ContextTypes.DEFAULT_TYPE, file_bytes: bytes):
+    """Common logic after getting file_bytes from photo or document."""
     caption = (update.message.caption or "").strip()
 
-    # Back image
     if caption.lower() == "back":
-        photo = update.message.photo[-1]
-        file = await photo.get_file()
-        file_bytes = bytes(await file.download_as_bytearray())
         await asyncio.to_thread(db.upload_back_image, file_bytes)
         await update.message.reply_text("✅ Рубашка карты установлена.")
         return
@@ -150,24 +133,47 @@ async def addcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    photo = update.message.photo[-1]
-    file = await photo.get_file()
-    file_bytes = bytes(await file.download_as_bytearray())
     image_url = await asyncio.to_thread(db.upload_card_image, card_id, file_bytes)
 
     if len(parts) == 2 and parts[1].strip():
-        # Full format with text description
         meaning = parts[1].strip()
         await asyncio.to_thread(db.add_card, card_id, f"Карта {card_id}", meaning, image_url)
         await update.message.reply_text(f"✅ Карта #{card_id} сохранена.")
     else:
-        # Photo only — wait for voice
         context.user_data["pending_card_id"] = card_id
         context.user_data["pending_card_image_url"] = image_url
         await update.message.reply_text(
             f"📸 Фото карты #{card_id} сохранено.\n\n"
             f"Теперь пришли голосовое с описанием этой карты."
         )
+
+
+async def addcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin sends card as photo (Telegram-compressed)."""
+    if not is_admin(update):
+        return
+    if not update.message.photo:
+        await update.message.reply_text(
+            "Пришли фото карты с номером в подписи, например: <code>5</code>",
+            parse_mode="HTML",
+        )
+        return
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+    file_bytes = bytes(await file.download_as_bytearray())
+    await _save_card_image(update, context, file_bytes)
+
+
+async def addcard_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin sends card as file/document — original quality, no Telegram compression."""
+    if not is_admin(update):
+        return
+    doc = update.message.document
+    if not doc or not doc.mime_type or not doc.mime_type.startswith("image/"):
+        return
+    file = await doc.get_file()
+    file_bytes = bytes(await file.download_as_bytearray())
+    await _save_card_image(update, context, file_bytes)
 
 
 async def handle_admin_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -298,6 +304,9 @@ def main():
     application.add_handler(CommandHandler("addcard", addcard))
     application.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & filters.PHOTO, addcard)
+    )
+    application.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.Document.IMAGE, addcard_document)
     )
     application.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & filters.VOICE, handle_admin_voice)
