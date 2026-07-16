@@ -150,7 +150,10 @@ async def _save_card_image(update: Update, context: ContextTypes.DEFAULT_TYPE, f
 
 async def addcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin sends card as photo (Telegram-compressed)."""
+    uid = update.effective_user.id if update.effective_user else "none"
+    logger.info(f"PHOTO from user_id={uid}, ADMIN_ID={ADMIN_ID}, is_admin={is_admin(update)}")
     if not is_admin(update):
+        await update.message.reply_text(f"Нет прав. Твой ID: {uid}, нужен: {ADMIN_ID}")
         return
     if not update.message.photo:
         await update.message.reply_text(
