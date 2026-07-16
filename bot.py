@@ -97,15 +97,31 @@ async def addcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Пришли фото карты с подписью в формате:\nID: Название: Расшифровка"
         )
         return
-    caption = update.message.caption or ""
+    caption = (update.message.caption or "").strip()
+
+    # Back image
+    if caption.lower() == "back":
+        photo = update.message.photo[-1]
+        file = await photo.get_file()
+        file_bytes = bytes(await file.download_as_bytearray())
+        await asyncio.to_thread(db.upload_back_image, file_bytes)
+        await update.message.reply_text("✅ Рубашка карты установлена.")
+        return
+
     parts = caption.split(":", 2)
     if len(parts) != 3:
-        await update.message.reply_text("Подпись должна быть: ID: Название: Расшифровка")
+        await update.message.reply_text(
+            "Не понял подпись. Формат:\n"
+            "<b>ID: Название: Описание</b>\n\n"
+            "Пример:\n<code>5: Доверие: Текст описания...</code>\n\n"
+            "Или отправь с подписью <code>back</code> для рубашки.",
+            parse_mode="HTML",
+        )
         return
     try:
         card_id = int(parts[0].strip())
     except ValueError:
-        await update.message.reply_text("ID должен быть числом.")
+        await update.message.reply_text("ID должен быть числом. Пример: <code>5: Название: Описание</code>", parse_mode="HTML")
         return
     name, meaning = parts[1].strip(), parts[2].strip()
 
@@ -115,25 +131,8 @@ async def addcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     image_url = await asyncio.to_thread(db.upload_card_image, card_id, file_bytes)
     await asyncio.to_thread(db.add_card, card_id, name, meaning, image_url)
-    await update.message.reply_text(f"Карта #{card_id} «{name}» сохранена.")
+    await update.message.reply_text(f"✅ Карта #{card_id} «{name}» сохранена.")
 
-
-async def setback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin sends card back photo with caption 'back' to set the rубашка image."""
-    if not is_admin(update):
-        return
-    if not update.message.photo:
-        await update.message.reply_text(
-            "Пришли фото рубашки карты с подписью «back»."
-        )
-        return
-
-    photo = update.message.photo[-1]
-    file = await photo.get_file()
-    file_bytes = bytes(await file.download_as_bytearray())
-
-    url = await asyncio.to_thread(db.upload_back_image, file_bytes)
-    await update.message.reply_text(f"✅ Рубашка карты установлена.")
 
 
 async def newspread(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -223,13 +222,9 @@ def main():
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("newspread", newspread))
     application.add_handler(CommandHandler("addcard", addcard))
-    # Photo with "back" caption → set card back image
+    # Any photo in private chat → addcard handles format check and feedback
     application.add_handler(
-        MessageHandler(filters.PHOTO & filters.CaptionRegex(r"(?i)^back$"), setback)
-    )
-    # Photo with numeric caption → add card
-    application.add_handler(
-        MessageHandler(filters.PHOTO & filters.CaptionRegex(r"^\d"), addcard)
+        MessageHandler(filters.ChatType.PRIVATE & filters.PHOTO, addcard)
     )
     application.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_private_message)
