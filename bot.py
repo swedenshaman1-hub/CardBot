@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import logging
 import os
 import tempfile
@@ -72,6 +73,30 @@ def _gemini_tts(text: str) -> str:
     return path
 
 
+def _transcribe_voice(ogg_bytes: bytes) -> str:
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=genai_types.HttpOptions(timeout=60_000),
+    )
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=genai_types.Content(
+            parts=[
+                genai_types.Part(
+                    text="Расшифруй точно что сказано в этом голосовом сообщении. Выдай только текст, без каких-либо комментариев и пояснений."
+                ),
+                genai_types.Part(
+                    inline_data=genai_types.Blob(
+                        mime_type="audio/ogg",
+                        data=base64.b64encode(ogg_bytes).decode(),
+                    )
+                ),
+            ]
+        ),
+    )
+    return response.text.strip()
+
+
 async def send_voice(update: Update, text: str):
     path = None
     try:
@@ -89,12 +114,17 @@ async def send_voice(update: Update, text: str):
 
 
 async def addcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin sends card photo with caption: ID: Описание"""
+    """Admin sends card photo.
+    Caption = just a number → bot awaits voice description.
+    Caption = "5: text" → saves immediately.
+    Caption = "back" → sets card back image.
+    """
     if not is_admin(update):
         return
     if not update.message.photo:
         await update.message.reply_text(
-            "Пришли фото карты с подписью:\n<code>5: Текст описания карты...</code>",
+            "Пришли фото карты с номером в подписи, например: <code>5</code>\n"
+            "Потом я попрошу продиктовать описание голосом.",
             parse_mode="HTML",
         )
         return
@@ -110,32 +140,75 @@ async def addcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     parts = caption.split(":", 1)
-    if len(parts) != 2:
-        await update.message.reply_text(
-            "Не понял подпись.\n\n"
-            "Формат: <code>5: Текст описания карты...</code>\n\n"
-            "Или <code>back</code> — для рубашки карт.",
-            parse_mode="HTML",
-        )
-        return
     try:
         card_id = int(parts[0].strip())
     except ValueError:
         await update.message.reply_text(
-            "Первым должен быть номер карты.\nПример: <code>5: Текст описания...</code>",
+            "Подпись должна начинаться с номера карты.\n"
+            "Пример: <code>5</code> или <code>5: текст описания</code>",
             parse_mode="HTML",
         )
         return
-    meaning = parts[1].strip()
 
     photo = update.message.photo[-1]
     file = await photo.get_file()
     file_bytes = bytes(await file.download_as_bytearray())
-
     image_url = await asyncio.to_thread(db.upload_card_image, card_id, file_bytes)
-    await asyncio.to_thread(db.add_card, card_id, f"Карта {card_id}", meaning, image_url)
-    await update.message.reply_text(f"✅ Карта #{card_id} сохранена.")
 
+    if len(parts) == 2 and parts[1].strip():
+        # Full format with text description
+        meaning = parts[1].strip()
+        await asyncio.to_thread(db.add_card, card_id, f"Карта {card_id}", meaning, image_url)
+        await update.message.reply_text(f"✅ Карта #{card_id} сохранена.")
+    else:
+        # Photo only — wait for voice
+        context.user_data["pending_card_id"] = card_id
+        context.user_data["pending_card_image_url"] = image_url
+        await update.message.reply_text(
+            f"📸 Фото карты #{card_id} сохранено.\n\n"
+            f"Теперь пришли голосовое с описанием этой карты."
+        )
+
+
+async def handle_admin_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin dictates card description as voice message."""
+    if not is_admin(update):
+        return
+
+    pending_id = context.user_data.get("pending_card_id")
+    pending_url = context.user_data.get("pending_card_image_url")
+
+    if pending_id is None:
+        await update.message.reply_text(
+            "Сначала отправь фото карты с номером в подписи, например: <code>5</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    msg = await update.message.reply_text("🎙️ Расшифровываю...")
+
+    voice = update.message.voice
+    file = await voice.get_file()
+    ogg_bytes = bytes(await file.download_as_bytearray())
+
+    try:
+        meaning = await asyncio.to_thread(_transcribe_voice, ogg_bytes)
+    except Exception as e:
+        logger.error(f"Transcription error: {e}")
+        await msg.edit_text("❌ Не удалось расшифровать. Попробуй ещё раз.")
+        return
+
+    await asyncio.to_thread(
+        db.add_card, pending_id, f"Карта {pending_id}", meaning, pending_url
+    )
+    context.user_data.pop("pending_card_id", None)
+    context.user_data.pop("pending_card_image_url", None)
+
+    await msg.edit_text(
+        f"✅ Карта #{pending_id} сохранена.\n\n"
+        f"<b>Описание:</b>\n{meaning}",
+        parse_mode="HTML",
+    )
 
 
 async def newspread(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -223,9 +296,11 @@ def main():
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("newspread", newspread))
     application.add_handler(CommandHandler("addcard", addcard))
-    # Any photo in private chat → addcard handles format check and feedback
     application.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & filters.PHOTO, addcard)
+    )
+    application.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.VOICE, handle_admin_voice)
     )
     application.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_private_message)
