@@ -34,17 +34,24 @@ def is_admin(update: Update) -> bool:
 async def send_voice(update: Update, text: str):
     fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
     os.close(fd)
+    fd2, fast_path = tempfile.mkstemp(suffix=".mp3")
+    os.close(fd2)
     try:
         await asyncio.to_thread(lambda: gTTS(text=text, lang="ru").save(mp3_path))
-        with open(mp3_path, "rb") as f:
+        await asyncio.to_thread(lambda: os.system(
+            f'ffmpeg -y -i "{mp3_path}" -filter:a "atempo=1.25" "{fast_path}" -loglevel quiet'
+        ))
+        send_path = fast_path if os.path.exists(fast_path) and os.path.getsize(fast_path) > 0 else mp3_path
+        with open(send_path, "rb") as f:
             await update.message.reply_voice(f)
     except Exception as e:
         logger.error(f"Voice error: {e}")
     finally:
-        try:
-            os.unlink(mp3_path)
-        except Exception:
-            pass
+        for p in (mp3_path, fast_path):
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
 
 
 async def addcard(update: Update, context: ContextTypes.DEFAULT_TYPE):

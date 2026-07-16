@@ -1,0 +1,5 @@
+[phases.setup]
+nixPkgs = ["ffmpeg", "fontconfig", "dejavu_fonts"]
+
+[start]
+cmd = "python bot.py"
