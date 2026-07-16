@@ -2,9 +2,11 @@ import asyncio
 import logging
 import os
 import tempfile
+import wave
 
 from dotenv import load_dotenv
-from gtts import gTTS
+from google import genai
+from google.genai import types as genai_types
 from telegram import InputFile, Update
 from telegram.ext import (
     Application,
@@ -22,6 +24,7 @@ load_dotenv()
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 CHANNEL_ID = os.environ["CHANNEL_ID"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,25 +34,56 @@ def is_admin(update: Update) -> bool:
     return update.effective_user is not None and update.effective_user.id == ADMIN_ID
 
 
-async def send_voice(update: Update, text: str):
-    fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
+def _gemini_tts(text: str) -> str:
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=genai_types.HttpOptions(timeout=120_000),
+    )
+    for attempt in range(3):
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash-preview-tts",
+                contents=text[:3000],
+                config=genai_types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=genai_types.SpeechConfig(
+                        voice_config=genai_types.VoiceConfig(
+                            prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
+                                voice_name="Kore"
+                            )
+                        )
+                    ),
+                ),
+            )
+            break
+        except Exception as e:
+            if any(x in str(e) for x in ("DEADLINE_EXCEEDED", "504", "timeout")) and attempt < 2:
+                continue
+            raise
+
+    pcm_data = response.candidates[0].content.parts[0].inline_data.data
+    fd, path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
-    fd2, fast_path = tempfile.mkstemp(suffix=".mp3")
-    os.close(fd2)
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(pcm_data)
+    return path
+
+
+async def send_voice(update: Update, text: str):
+    path = None
     try:
-        await asyncio.to_thread(lambda: gTTS(text=text, lang="ru").save(mp3_path))
-        await asyncio.to_thread(lambda: os.system(
-            f'ffmpeg -y -i "{mp3_path}" -filter:a "atempo=1.25" "{fast_path}" -loglevel quiet'
-        ))
-        send_path = fast_path if os.path.exists(fast_path) and os.path.getsize(fast_path) > 0 else mp3_path
-        with open(send_path, "rb") as f:
+        path = await asyncio.to_thread(_gemini_tts, text)
+        with open(path, "rb") as f:
             await update.message.reply_voice(f)
     except Exception as e:
         logger.error(f"Voice error: {e}")
     finally:
-        for p in (mp3_path, fast_path):
+        if path:
             try:
-                os.unlink(p)
+                os.unlink(path)
             except Exception:
                 pass
 
