@@ -89,12 +89,13 @@ async def send_voice(update: Update, text: str):
 
 
 async def addcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin sends card photo with caption: ID: Название: Расшифровка"""
+    """Admin sends card photo with caption: ID: Описание"""
     if not is_admin(update):
         return
     if not update.message.photo:
         await update.message.reply_text(
-            "Пришли фото карты с подписью в формате:\nID: Название: Расшифровка"
+            "Пришли фото карты с подписью:\n<code>5: Текст описания карты...</code>",
+            parse_mode="HTML",
         )
         return
     caption = (update.message.caption or "").strip()
@@ -108,30 +109,32 @@ async def addcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Рубашка карты установлена.")
         return
 
-    parts = caption.split(":", 2)
-    if len(parts) != 3:
+    parts = caption.split(":", 1)
+    if len(parts) != 2:
         await update.message.reply_text(
-            "Не понял подпись. Формат:\n"
-            "<b>ID: Название: Описание</b>\n\n"
-            "Пример:\n<code>5: Доверие: Текст описания...</code>\n\n"
-            "Или отправь с подписью <code>back</code> для рубашки.",
+            "Не понял подпись.\n\n"
+            "Формат: <code>5: Текст описания карты...</code>\n\n"
+            "Или <code>back</code> — для рубашки карт.",
             parse_mode="HTML",
         )
         return
     try:
         card_id = int(parts[0].strip())
     except ValueError:
-        await update.message.reply_text("ID должен быть числом. Пример: <code>5: Название: Описание</code>", parse_mode="HTML")
+        await update.message.reply_text(
+            "Первым должен быть номер карты.\nПример: <code>5: Текст описания...</code>",
+            parse_mode="HTML",
+        )
         return
-    name, meaning = parts[1].strip(), parts[2].strip()
+    meaning = parts[1].strip()
 
     photo = update.message.photo[-1]
     file = await photo.get_file()
     file_bytes = bytes(await file.download_as_bytearray())
 
     image_url = await asyncio.to_thread(db.upload_card_image, card_id, file_bytes)
-    await asyncio.to_thread(db.add_card, card_id, name, meaning, image_url)
-    await update.message.reply_text(f"✅ Карта #{card_id} «{name}» сохранена.")
+    await asyncio.to_thread(db.add_card, card_id, f"Карта {card_id}", meaning, image_url)
+    await update.message.reply_text(f"✅ Карта #{card_id} сохранена.")
 
 
 
@@ -195,12 +198,10 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("Карта не найдена.")
         return
 
-    caption = f"🃏 *{card['name']}*\n\n{card['meaning']}"
     await context.bot.send_chat_action(update.effective_chat.id, "upload_photo")
     await update.message.reply_photo(
         photo=card["image_url"],
-        caption=caption,
-        parse_mode="Markdown",
+        caption=card["meaning"],
     )
 
     await context.bot.send_chat_action(update.effective_chat.id, "record_voice")
