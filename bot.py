@@ -296,6 +296,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Exception: {context.error}", exc_info=context.error)
+
+
 def main():
     db.init_db()
     application = Application.builder().token(BOT_TOKEN).build()
@@ -303,20 +307,15 @@ def main():
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("newspread", newspread))
     application.add_handler(CommandHandler("addcard", addcard))
-    application.add_handler(
-        MessageHandler(filters.ChatType.PRIVATE & filters.PHOTO, addcard)
-    )
-    application.add_handler(
-        MessageHandler(filters.ChatType.PRIVATE & filters.Document.IMAGE, addcard_document)
-    )
-    application.add_handler(
-        MessageHandler(filters.ChatType.PRIVATE & filters.VOICE, handle_admin_voice)
-    )
+    application.add_handler(MessageHandler(filters.PHOTO, addcard))
+    application.add_handler(MessageHandler(filters.Document.IMAGE, addcard_document))
+    application.add_handler(MessageHandler(filters.VOICE, handle_admin_voice))
     application.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_private_message)
     )
+    application.add_error_handler(error_handler)
 
-    application.run_polling()
+    application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
