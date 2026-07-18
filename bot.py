@@ -314,6 +314,22 @@ async def deletecard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Карта #{card_id} удалена.")
 
 
+async def editcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Использование: /editcard 5 новый текст описания")
+        return
+    try:
+        card_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Первым должен быть номер карты.")
+        return
+    meaning = " ".join(context.args[1:])
+    await asyncio.to_thread(db.update_card_meaning, card_id, meaning)
+    await update.message.reply_text(f"✅ Текст карты #{card_id} обновлён.\n\n{meaning}")
+
+
 async def clearcards(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
@@ -342,6 +358,7 @@ def main():
     application.add_handler(CommandHandler("addcard", addcard))
     application.add_handler(CommandHandler("listcards", listcards))
     application.add_handler(CommandHandler("deletecard", deletecard))
+    application.add_handler(CommandHandler("editcard", editcard))
     application.add_handler(CommandHandler("clearcards", clearcards))
     application.add_handler(MessageHandler(filters.PHOTO, addcard))
     application.add_handler(MessageHandler(filters.Document.IMAGE, addcard_document))
