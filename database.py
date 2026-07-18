@@ -45,6 +45,11 @@ def delete_card(card_id: int):
     client.table("cards").delete().eq("id", card_id).execute()
 
 
+def delete_all_cards():
+    client = get_client()
+    client.table("cards").delete().neq("id", 0).execute()
+
+
 def add_card(card_id: int, name: str, meaning: str, image_url: str):
     client = get_client()
     client.table("cards").upsert(

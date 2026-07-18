@@ -314,6 +314,13 @@ async def deletecard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Карта #{card_id} удалена.")
 
 
+async def clearcards(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    await asyncio.to_thread(db.delete_all_cards)
+    await update.message.reply_text("✅ Все карты удалены. База чистая.")
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔮 Добро пожаловать!\n\n"
@@ -335,6 +342,7 @@ def main():
     application.add_handler(CommandHandler("addcard", addcard))
     application.add_handler(CommandHandler("listcards", listcards))
     application.add_handler(CommandHandler("deletecard", deletecard))
+    application.add_handler(CommandHandler("clearcards", clearcards))
     application.add_handler(MessageHandler(filters.PHOTO, addcard))
     application.add_handler(MessageHandler(filters.Document.IMAGE, addcard_document))
     application.add_handler(MessageHandler(filters.VOICE, handle_admin_voice))
