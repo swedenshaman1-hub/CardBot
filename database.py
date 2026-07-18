@@ -1,4 +1,5 @@
 import os
+import time
 from datetime import datetime, timezone
 
 from supabase import create_client
@@ -25,11 +26,11 @@ def init_db():
 
 def upload_card_image(card_id: int, file_bytes: bytes) -> str:
     client = get_client()
-    path = f"{card_id}.jpg"
+    path = f"{card_id}_{int(time.time())}.jpg"
     client.storage.from_(BUCKET).upload(
         path,
         file_bytes,
-        {"content-type": "image/jpeg", "upsert": "true"},
+        {"content-type": "image/jpeg"},
     )
     return client.storage.from_(BUCKET).get_public_url(path)
 
