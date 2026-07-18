@@ -288,6 +288,33 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     await send_voice(update, card["meaning"])
 
 
+async def listcards(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    cards = await asyncio.to_thread(db.list_all_cards)
+    if not cards:
+        await update.message.reply_text("Карт пока нет.")
+        return
+    lines = [f"#{c['id']} — {c['meaning'][:60]}{'…' if len(c['meaning']) > 60 else ''}" for c in cards]
+    text = f"Загружено карт: {len(cards)}\n\n" + "\n".join(lines)
+    await update.message.reply_text(text)
+
+
+async def deletecard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /deletecard 5")
+        return
+    try:
+        card_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом.")
+        return
+    await asyncio.to_thread(db.delete_card, card_id)
+    await update.message.reply_text(f"✅ Карта #{card_id} удалена.")
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔮 Добро пожаловать!\n\n"
@@ -307,6 +334,8 @@ def main():
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("newspread", newspread))
     application.add_handler(CommandHandler("addcard", addcard))
+    application.add_handler(CommandHandler("listcards", listcards))
+    application.add_handler(CommandHandler("deletecard", deletecard))
     application.add_handler(MessageHandler(filters.PHOTO, addcard))
     application.add_handler(MessageHandler(filters.Document.IMAGE, addcard_document))
     application.add_handler(MessageHandler(filters.VOICE, handle_admin_voice))

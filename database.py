@@ -34,6 +34,17 @@ def upload_card_image(card_id: int, file_bytes: bytes) -> str:
     return client.storage.from_(BUCKET).get_public_url(path)
 
 
+def list_all_cards() -> list[dict]:
+    client = get_client()
+    res = client.table("cards").select("id, name, meaning").order("id").execute()
+    return res.data
+
+
+def delete_card(card_id: int):
+    client = get_client()
+    client.table("cards").delete().eq("id", card_id).execute()
+
+
 def add_card(card_id: int, name: str, meaning: str, image_url: str):
     client = get_client()
     client.table("cards").upsert(
