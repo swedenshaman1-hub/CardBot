@@ -115,7 +115,7 @@ async def send_voice(update: Update, text: str):
                 pass
 
 
-def narrow_card_text(meaning: str, heading: str | None = None, line_limit: int = 27) -> str:
+def narrow_card_text(meaning: str, heading: str | None = None, line_limit: int = 20) -> str:
     """Wrap text narrowly so its Telegram bubble stays close to card width."""
     result: list[str] = [heading] if heading else []
     if heading:
@@ -386,7 +386,7 @@ async def send_review_card(bot, chat_id: int, card_id: int, context: ContextType
     photo = await bot.send_photo(chat_id=chat_id, photo=card["image_url"])
     text = await bot.send_message(
         chat_id=chat_id,
-        text=narrow_card_text(card["meaning"], f"🔎 Проверка карты №{card_id}"),
+        text=narrow_card_text(card["meaning"], f"🔎 Карта №{card_id}"),
         reply_markup=review_keyboard(card_id),
     )
 
