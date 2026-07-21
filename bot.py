@@ -115,24 +115,38 @@ async def send_voice(update: Update, text: str):
                 pass
 
 
+def narrow_card_text(meaning: str, heading: str | None = None, line_limit: int = 27) -> str:
+    """Wrap text narrowly so its Telegram bubble stays close to card width."""
+    result: list[str] = [heading] if heading else []
+    if heading:
+        result.append("")
+    for paragraph in meaning.strip().splitlines():
+        words = paragraph.split()
+        if not words:
+            result.append("")
+            continue
+        line = ""
+        for word in words:
+            candidate = f"{line} {word}".strip()
+            if line and len(candidate) > line_limit:
+                result.append(line)
+                line = word
+            else:
+                line = candidate
+        if line:
+            result.append(line)
+    return "\n".join(result)
+
+
 async def send_card_to_chat(bot, chat_id: int, card_id: int):
     """Send the original card image, its description and a voice reading."""
     card = await asyncio.to_thread(db.get_card, card_id)
     if card is None:
         raise ValueError(f"Card #{card_id} not found")
 
-    reading_path = None
-    try:
-        await bot.send_chat_action(chat_id, "upload_photo")
-        reading_path = await asyncio.to_thread(build_card_reading, card["image_url"], card["meaning"])
-        with open(reading_path, "rb") as image:
-            await bot.send_photo(chat_id=chat_id, photo=image)
-    finally:
-        if reading_path:
-            try:
-                os.unlink(reading_path)
-            except OSError:
-                pass
+    await bot.send_chat_action(chat_id, "upload_photo")
+    await bot.send_photo(chat_id=chat_id, photo=card["image_url"])
+    await bot.send_message(chat_id=chat_id, text=narrow_card_text(card["meaning"]))
 
     voice_path = None
     try:
@@ -365,6 +379,33 @@ async def send_review_card(bot, chat_id: int, card_id: int, context: ContextType
     card = await asyncio.to_thread(db.get_card, card_id)
     if card is None:
         raise ValueError(f"Card #{card_id} not found")
+
+    # Review is deliberately three separate Telegram messages:
+    # original card, narrow text beneath it, then a voice reading.
+    await bot.send_chat_action(chat_id, "upload_photo")
+    photo = await bot.send_photo(chat_id=chat_id, photo=card["image_url"])
+    text = await bot.send_message(
+        chat_id=chat_id,
+        text=narrow_card_text(card["meaning"], f"🔎 Проверка карты №{card_id}"),
+        reply_markup=review_keyboard(card_id),
+    )
+
+    voice_path = None
+    try:
+        await bot.send_chat_action(chat_id, "record_voice")
+        voice_path = await asyncio.to_thread(_gemini_tts, card["meaning"])
+        with open(voice_path, "rb") as audio:
+            voice = await bot.send_voice(chat_id=chat_id, voice=audio)
+    finally:
+        if voice_path:
+            try:
+                os.unlink(voice_path)
+            except OSError:
+                pass
+    context.user_data["review_photo_message_id"] = photo.message_id
+    context.user_data["review_text_message_id"] = text.message_id
+    context.user_data["review_voice_message_id"] = voice.message_id
+    return
 
     # Keep the card and its text inside one image, so Telegram cannot make
     # a description bubble wider than the card itself.
