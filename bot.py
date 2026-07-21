@@ -347,6 +347,78 @@ async def select_card_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
 
+def review_keyboard(card_id: int) -> InlineKeyboardMarkup:
+    previous_id = max(1, card_id - 1)
+    next_id = min(120, card_id + 1)
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("◀️", callback_data=f"review:{previous_id}"),
+            InlineKeyboardButton("✓ Верно", callback_data=f"review-ok:{card_id}"),
+            InlineKeyboardButton("▶️", callback_data=f"review:{next_id}"),
+        ]
+    ])
+
+
+async def send_review_card(bot, chat_id: int, card_id: int, context: ContextTypes.DEFAULT_TYPE):
+    card = await asyncio.to_thread(db.get_card, card_id)
+    if card is None:
+        raise ValueError(f"Card #{card_id} not found")
+    photo = await bot.send_photo(chat_id=chat_id, photo=card["image_url"])
+    text = await bot.send_message(
+        chat_id=chat_id,
+        text=f"🔎 Проверка карты №{card_id}\n\n{card['meaning']}",
+        reply_markup=review_keyboard(card_id),
+    )
+    context.user_data["review_photo_message_id"] = photo.message_id
+    context.user_data["review_text_message_id"] = text.message_id
+
+
+async def review_cards(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only sequential review of all original cards and their texts."""
+    if not is_admin(update):
+        return
+    try:
+        card_id = int(context.args[0]) if context.args else 1
+    except ValueError:
+        await update.message.reply_text("Использование: /review 1")
+        return
+    if not 1 <= card_id <= 120:
+        await update.message.reply_text("Номер карты — от 1 до 120.")
+        return
+    await send_review_card(context.bot, update.effective_chat.id, card_id, context)
+
+
+async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query is None or not is_admin(update):
+        return
+
+    if query.data.startswith("review-ok:"):
+        card_id = query.data.split(":", 1)[1]
+        await query.answer(f"Карта №{card_id} отмечена как проверенная.")
+        return
+
+    try:
+        card_id = int(query.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await query.answer("Не удалось открыть карту.", show_alert=True)
+        return
+
+    await query.answer()
+    # Remove the previous pair, so the review chat stays clean.
+    old_photo_id = context.user_data.get("review_photo_message_id")
+    if old_photo_id:
+        try:
+            await context.bot.delete_message(query.message.chat_id, old_photo_id)
+        except Exception:
+            pass
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    await send_review_card(context.bot, query.message.chat_id, card_id, context)
+
+
 async def listcards(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
@@ -420,7 +492,9 @@ def main():
     application.add_handler(CommandHandler("deletecard", deletecard))
     application.add_handler(CommandHandler("editcard", editcard))
     application.add_handler(CommandHandler("clearcards", clearcards))
+    application.add_handler(CommandHandler("review", review_cards))
     application.add_handler(CallbackQueryHandler(select_card_callback, pattern=r"^card:"))
+    application.add_handler(CallbackQueryHandler(review_callback, pattern=r"^review"))
     application.add_handler(MessageHandler(filters.PHOTO, addcard))
     application.add_handler(MessageHandler(filters.Document.IMAGE, addcard_document))
     application.add_handler(MessageHandler(filters.VOICE, handle_admin_voice))
