@@ -42,11 +42,52 @@ def _gemini_tts(text: str) -> str:
         api_key=GEMINI_API_KEY,
         http_options=genai_types.HttpOptions(timeout=120_000),
     )
-    for attempt in range(3):
+    pcm_data = b""
+    for chunk in _split_tts_text(text):
+        pcm_data += _gemini_tts_chunk(client, chunk)
+
+    fd, path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(pcm_data)
+    return path
+
+
+def _split_tts_text(text: str, max_chars: int = 1200) -> list[str]:
+    text = " ".join(text.split())
+    if not text:
+        return []
+
+    chunks: list[str] = []
+    current = ""
+    for sentence in text.replace("!", "!.").replace("?", "?.").split("."):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if not sentence.endswith((".", "!", "?")):
+            sentence += "."
+        if current and len(current) + len(sentence) + 1 > max_chars:
+            chunks.append(current)
+            current = sentence
+        else:
+            current = f"{current} {sentence}".strip()
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _gemini_tts_chunk(client: genai.Client, text: str) -> bytes:
+    prompt = f"Прочитай спокойным красивым голосом на русском языке:\n\n{text}"
+    last_error = None
+    for attempt in range(4):
         try:
             response = client.models.generate_content(
                 model="gemini-2.5-flash-preview-tts",
-                contents=text[:3000],
+                contents=prompt,
                 config=genai_types.GenerateContentConfig(
                     response_modalities=["AUDIO"],
                     speech_config=genai_types.SpeechConfig(
@@ -58,21 +99,22 @@ def _gemini_tts(text: str) -> str:
                     ),
                 ),
             )
-            break
+            for candidate in response.candidates or []:
+                content = candidate.content
+                for part in getattr(content, "parts", None) or []:
+                    inline_data = getattr(part, "inline_data", None)
+                    if inline_data and inline_data.data:
+                        if isinstance(inline_data.data, str):
+                            return base64.b64decode(inline_data.data)
+                        return inline_data.data
+            last_error = "Gemini TTS returned no audio"
         except Exception as e:
-            if any(x in str(e) for x in ("DEADLINE_EXCEEDED", "504", "timeout")) and attempt < 2:
-                continue
-            raise
+            last_error = e
 
-    pcm_data = response.candidates[0].content.parts[0].inline_data.data
-    fd, path = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
-    with wave.open(path, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(24000)
-        wf.writeframes(pcm_data)
-    return path
+        if attempt < 3:
+            continue
+
+    raise RuntimeError(f"TTS failed: {last_error}")
 
 
 def _transcribe_voice(ogg_bytes: bytes) -> str:
@@ -136,6 +178,8 @@ async def send_card_to_chat(bot, chat_id: int, card_id: int):
         voice_path = await asyncio.to_thread(_gemini_tts, card["meaning"])
         with open(voice_path, "rb") as audio:
             await bot.send_voice(chat_id=chat_id, voice=audio)
+    except Exception as e:
+        logger.exception("Card voice error for card %s: %s", card_id, e)
     finally:
         if voice_path:
             try:
@@ -373,11 +417,14 @@ async def send_review_card(bot, chat_id: int, card_id: int, context: ContextType
     )
 
     voice_path = None
+    voice = None
     try:
         await bot.send_chat_action(chat_id, "record_voice")
         voice_path = await asyncio.to_thread(_gemini_tts, card["meaning"])
         with open(voice_path, "rb") as audio:
             voice = await bot.send_voice(chat_id=chat_id, voice=audio)
+    except Exception as e:
+        logger.exception("Review voice error for card %s: %s", card_id, e)
     finally:
         if voice_path:
             try:
@@ -386,7 +433,8 @@ async def send_review_card(bot, chat_id: int, card_id: int, context: ContextType
                 pass
     context.user_data["review_photo_message_id"] = photo.message_id
     context.user_data["review_text_message_id"] = text.message_id
-    context.user_data["review_voice_message_id"] = voice.message_id
+    if voice:
+        context.user_data["review_voice_message_id"] = voice.message_id
     return
 
     # Keep the card and its text inside one image, so Telegram cannot make
