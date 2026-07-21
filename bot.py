@@ -115,27 +115,9 @@ async def send_voice(update: Update, text: str):
                 pass
 
 
-def narrow_card_text(meaning: str, heading: str | None = None, line_limit: int = 20) -> str:
-    """Wrap text narrowly so its Telegram bubble stays close to card width."""
-    result: list[str] = [heading] if heading else []
-    if heading:
-        result.append("")
-    for paragraph in meaning.strip().splitlines():
-        words = paragraph.split()
-        if not words:
-            result.append("")
-            continue
-        line = ""
-        for word in words:
-            candidate = f"{line} {word}".strip()
-            if line and len(candidate) > line_limit:
-                result.append(line)
-                line = word
-            else:
-                line = candidate
-        if line:
-            result.append(line)
-    return "\n".join(result)
+def narrow_card_text(meaning: str, heading: str | None = None) -> str:
+    """Return normal Telegram text without artificial line wrapping."""
+    return f"{heading}\n\n{meaning.strip()}" if heading else meaning.strip()
 
 
 async def send_card_to_chat(bot, chat_id: int, card_id: int):
