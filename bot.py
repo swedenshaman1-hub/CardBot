@@ -20,6 +20,7 @@ from telegram.ext import (
 
 import database as db
 from collage import build_collage
+from card_reading import build_card_reading
 
 load_dotenv()
 
@@ -120,10 +121,18 @@ async def send_card_to_chat(bot, chat_id: int, card_id: int):
     if card is None:
         raise ValueError(f"Card #{card_id} not found")
 
-    await bot.send_chat_action(chat_id, "upload_photo")
-    # Keep the original artwork completely clean: description is a separate message.
-    await bot.send_photo(chat_id=chat_id, photo=card["image_url"])
-    await bot.send_message(chat_id=chat_id, text=card["meaning"])
+    reading_path = None
+    try:
+        await bot.send_chat_action(chat_id, "upload_photo")
+        reading_path = await asyncio.to_thread(build_card_reading, card["image_url"], card["meaning"])
+        with open(reading_path, "rb") as image:
+            await bot.send_photo(chat_id=chat_id, photo=image)
+    finally:
+        if reading_path:
+            try:
+                os.unlink(reading_path)
+            except OSError:
+                pass
 
     voice_path = None
     try:
@@ -313,14 +322,7 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("Карта не найдена.")
         return
 
-    await context.bot.send_chat_action(update.effective_chat.id, "upload_photo")
-    await update.message.reply_photo(
-        photo=card["image_url"],
-    )
-    await update.message.reply_text(card["meaning"])
-
-    await context.bot.send_chat_action(update.effective_chat.id, "record_voice")
-    await send_voice(update, card["meaning"])
+    await send_card_to_chat(context.bot, update.effective_chat.id, card_id)
 
 
 async def select_card_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
