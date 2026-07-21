@@ -1,4 +1,4 @@
-"""Render a card and its description into one clean, Telegram-friendly image."""
+"""Render an original card and its description as one Telegram-friendly image."""
 
 from io import BytesIO
 import os
@@ -18,7 +18,7 @@ def _font(size: int, bold: bool = False):
         try:
             return ImageFont.truetype(candidate, size)
         except OSError:
-            pass
+            continue
     return ImageFont.load_default()
 
 
@@ -41,8 +41,8 @@ def _wrap(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[st
     return lines
 
 
-def build_card_reading(image_url: str, meaning: str) -> str:
-    """Return a temporary JPG: untouched card artwork followed by its text panel."""
+def build_card_reading(image_url: str, meaning: str, title: str = "Расшифровка") -> str:
+    """Return one JPG: untouched card artwork above a text panel of exactly its width."""
     response = requests.get(image_url, timeout=30)
     response.raise_for_status()
     card = Image.open(BytesIO(response.content)).convert("RGB")
@@ -56,8 +56,9 @@ def build_card_reading(image_url: str, meaning: str) -> str:
     measure = Image.new("RGB", (width, 100), "white")
     measure_draw = ImageDraw.Draw(measure)
     lines = _wrap(measure_draw, meaning.strip(), body_font, width - margin * 2)
-    line_height = int(body_font.getbbox("Аg")[3] * 1.35)
-    panel_height = margin + 8 + int(title_font.getbbox("Расшифровка")[3] * 1.3) + 26 + len(lines) * line_height + max(0, len(lines) - 1) * line_gap + margin
+    line_height = int(body_font.getbbox("Ag")[3] * 1.35)
+    title_height = int(title_font.getbbox(title)[3] * 1.3)
+    panel_height = margin + 8 + title_height + 26 + len(lines) * line_height + max(0, len(lines) - 1) * line_gap + margin
 
     canvas = Image.new("RGB", (width, card.height + panel_height), "#17130f")
     canvas.paste(card, (0, 0))
@@ -66,8 +67,8 @@ def build_card_reading(image_url: str, meaning: str) -> str:
     draw.rectangle((0, top, width, top + panel_height), fill="#17130f")
     draw.line((margin, top + margin, width - margin, top + margin), fill="#C49352", width=max(2, width // 450))
     y = top + margin + 24
-    draw.text((margin, y), "Расшифровка", fill="#D9B67A", font=title_font)
-    y += int(title_font.getbbox("Расшифровка")[3] * 1.5) + 20
+    draw.text((margin, y), title, fill="#D9B67A", font=title_font)
+    y += int(title_font.getbbox(title)[3] * 1.5) + 20
     for line in lines:
         draw.text((margin, y), line, fill="#F7F1E7", font=body_font)
         y += line_height + line_gap

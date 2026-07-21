@@ -365,6 +365,41 @@ async def send_review_card(bot, chat_id: int, card_id: int, context: ContextType
     card = await asyncio.to_thread(db.get_card, card_id)
     if card is None:
         raise ValueError(f"Card #{card_id} not found")
+
+    # Keep the card and its text inside one image, so Telegram cannot make
+    # a description bubble wider than the card itself.
+    reading_path = None
+    voice_path = None
+    try:
+        await bot.send_chat_action(chat_id, "upload_photo")
+        reading_path = await asyncio.to_thread(
+            build_card_reading,
+            card["image_url"],
+            card["meaning"],
+            f"Проверка карты №{card_id}",
+        )
+        with open(reading_path, "rb") as image:
+            photo = await bot.send_photo(
+                chat_id=chat_id,
+                photo=image,
+                reply_markup=review_keyboard(card_id),
+            )
+
+        await bot.send_chat_action(chat_id, "record_voice")
+        voice_path = await asyncio.to_thread(_gemini_tts, card["meaning"])
+        with open(voice_path, "rb") as audio:
+            voice = await bot.send_voice(chat_id=chat_id, voice=audio)
+        context.user_data["review_voice_message_id"] = voice.message_id
+        context.user_data["review_photo_message_id"] = photo.message_id
+    finally:
+        for path in (reading_path, voice_path):
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+    return
+
     photo = await bot.send_photo(chat_id=chat_id, photo=card["image_url"])
     text = await bot.send_message(
         chat_id=chat_id,
@@ -408,6 +443,12 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.answer()
     # Remove the previous pair, so the review chat stays clean.
+    old_voice_id = context.user_data.get("review_voice_message_id")
+    if old_voice_id:
+        try:
+            await context.bot.delete_message(query.message.chat_id, old_voice_id)
+        except Exception:
+            pass
     old_photo_id = context.user_data.get("review_photo_message_id")
     if old_photo_id:
         try:
