@@ -8,9 +8,10 @@ import wave
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
-from telegram import InputFile, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -110,6 +111,29 @@ async def send_voice(update: Update, text: str):
             try:
                 os.unlink(path)
             except Exception:
+                pass
+
+
+async def send_card_to_chat(bot, chat_id: int, card_id: int):
+    """Send the original card image, its description and a voice reading."""
+    card = await asyncio.to_thread(db.get_card, card_id)
+    if card is None:
+        raise ValueError(f"Card #{card_id} not found")
+
+    await bot.send_chat_action(chat_id, "upload_photo")
+    await bot.send_photo(chat_id=chat_id, photo=card["image_url"], caption=card["meaning"])
+
+    voice_path = None
+    try:
+        await bot.send_chat_action(chat_id, "record_voice")
+        voice_path = await asyncio.to_thread(_gemini_tts, card["meaning"])
+        with open(voice_path, "rb") as audio:
+            await bot.send_voice(chat_id=chat_id, voice=audio)
+    finally:
+        if voice_path:
+            try:
+                os.unlink(voice_path)
+            except OSError:
                 pass
 
 
@@ -247,6 +271,16 @@ async def newspread(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Выбери свою карту — напиши её номер боту в личные сообщения."
             ),
             parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(str(position), callback_data=f"card:{card_id}:{position}")
+                    for position, card_id in enumerate(card_ids[:3], start=1)
+                ],
+                [
+                    InlineKeyboardButton(str(position), callback_data=f"card:{card_id}:{position}")
+                    for position, card_id in enumerate(card_ids[3:], start=4)
+                ],
+            ]),
         )
     os.remove(collage_path)
 
@@ -285,6 +319,30 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
     await context.bot.send_chat_action(update.effective_chat.id, "record_voice")
     await send_voice(update, card["meaning"])
+
+
+async def select_card_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle a click on a 1–6 button under the channel post."""
+    query = update.callback_query
+    if query is None or not query.data or not query.data.startswith("card:"):
+        return
+
+    _, card_id_text, _position = query.data.split(":", 2)
+    try:
+        card_id = int(card_id_text)
+    except ValueError:
+        await query.answer("Не удалось определить карту.", show_alert=True)
+        return
+
+    await query.answer("Открываю карту…")
+    try:
+        await send_card_to_chat(context.bot, query.from_user.id, card_id)
+    except Exception as exc:
+        logger.exception("Could not send selected card", exc_info=exc)
+        await query.answer(
+            "Сначала открой бота в личных сообщениях и нажми Start, затем выбери карту снова.",
+            show_alert=True,
+        )
 
 
 async def listcards(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -360,6 +418,7 @@ def main():
     application.add_handler(CommandHandler("deletecard", deletecard))
     application.add_handler(CommandHandler("editcard", editcard))
     application.add_handler(CommandHandler("clearcards", clearcards))
+    application.add_handler(CallbackQueryHandler(select_card_callback, pattern=r"^card:"))
     application.add_handler(MessageHandler(filters.PHOTO, addcard))
     application.add_handler(MessageHandler(filters.Document.IMAGE, addcard_document))
     application.add_handler(MessageHandler(filters.VOICE, handle_admin_voice))
