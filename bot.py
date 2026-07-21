@@ -121,7 +121,9 @@ async def send_card_to_chat(bot, chat_id: int, card_id: int):
         raise ValueError(f"Card #{card_id} not found")
 
     await bot.send_chat_action(chat_id, "upload_photo")
-    await bot.send_photo(chat_id=chat_id, photo=card["image_url"], caption=card["meaning"])
+    # Keep the original artwork completely clean: description is a separate message.
+    await bot.send_photo(chat_id=chat_id, photo=card["image_url"])
+    await bot.send_message(chat_id=chat_id, text=card["meaning"])
 
     voice_path = None
     try:
@@ -314,8 +316,8 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     await context.bot.send_chat_action(update.effective_chat.id, "upload_photo")
     await update.message.reply_photo(
         photo=card["image_url"],
-        caption=card["meaning"],
     )
+    await update.message.reply_text(card["meaning"])
 
     await context.bot.send_chat_action(update.effective_chat.id, "record_voice")
     await send_voice(update, card["meaning"])
