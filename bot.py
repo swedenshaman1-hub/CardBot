@@ -33,6 +33,9 @@ MAX_CARDS_PER_SPREAD = 2
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+# python-telegram-bot uses httpx internally; its INFO lines contain the complete
+# Bot API URL, including the secret token. Never write that to Railway logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def is_admin(update: Update) -> bool:
@@ -733,7 +736,9 @@ async def verify_runtime(application: Application):
     """Log whether Telegram can use the configured chat for subscriptions."""
     try:
         me = await application.bot.get_me()
+        logger.info("Card bot identity: @%s", me.username)
         chat = await application.bot.get_chat(CHANNEL_ID)
+        logger.info("Card access chat: title=%s type=%s", chat.title, chat.type)
         member = await application.bot.get_chat_member(CHANNEL_ID, me.id)
         logger.info(
             "Card access target: bot=@%s chat_type=%s bot_status=%s",
@@ -747,6 +752,13 @@ async def verify_runtime(application: Application):
             logger.warning(
                 "Bot should be an administrator for reliable membership checks"
             )
+    except BadRequest as exc:
+        if "member list is inaccessible" in str(exc).lower():
+            logger.error(
+                "Card access is blocked: add the bot as a channel administrator"
+            )
+        else:
+            logger.exception("Card access startup check failed", exc_info=exc)
     except TelegramError as exc:
         logger.exception("Card access startup check failed", exc_info=exc)
 
