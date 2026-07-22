@@ -78,8 +78,8 @@ async def require_channel_subscription(bot, user_id: int) -> tuple[bool, str | N
     if subscribed is False:
         return (
             False,
-            "Расклад доступен только подписчикам канала. "
-            "Подпишись и нажми карту ещё раз.",
+            "Карта дня доступна только подписчикам канала. "
+            "Подпишись и попробуй ещё раз.",
         )
     return False, "Не удалось проверить подписку. Попробуй ещё раз через минуту."
 
@@ -210,14 +210,27 @@ def narrow_card_text(meaning: str, heading: str | None = None) -> str:
 
 
 async def send_card_to_chat(bot, chat_id: int, card_id: int):
-    """Send the original card image, its description and a voice reading."""
+    """Send the original card image and text with an optional voice button."""
     card = await asyncio.to_thread(db.get_card, card_id)
     if card is None:
         raise ValueError(f"Card #{card_id} not found")
 
     await bot.send_chat_action(chat_id, "upload_photo")
     await bot.send_photo(chat_id=chat_id, photo=card["image_url"])
-    await bot.send_message(chat_id=chat_id, text=narrow_card_text(card["meaning"]))
+    await bot.send_message(
+        chat_id=chat_id,
+        text=narrow_card_text(card["meaning"]),
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🎧 Прослушать послание", callback_data=f"voice:{card_id}")]]
+        ),
+    )
+
+
+async def send_card_voice(bot, chat_id: int, card_id: int):
+    """Generate and send a voice reading for a card."""
+    card = await asyncio.to_thread(db.get_card, card_id)
+    if card is None:
+        raise ValueError(f"Card #{card_id} not found")
 
     voice_path = None
     try:
@@ -227,6 +240,7 @@ async def send_card_to_chat(bot, chat_id: int, card_id: int):
             await bot.send_voice(chat_id=chat_id, voice=audio)
     except Exception as e:
         logger.exception("Card voice error for card %s: %s", card_id, e)
+        raise
     finally:
         if voice_path:
             try:
@@ -366,9 +380,9 @@ async def newspread(update: Update, context: ContextTypes.DEFAULT_TYPE):
             photo=InputFile(f),
             caption=(
                 "🔮 *Карты дня*\n\n"
-                "Выбери *две карты из шести* и нажми их номера ниже.\n"
-                "Расшифровку получают только подписчики канала.\n"
-                "После второго выбора остальные карты для тебя будут закрыты."
+                "Чтобы получить карту дня, подпишись на канал и выбери *до двух карт из шести*.\n"
+                "Нажми номер карты ниже — расшифровка придёт тебе в личные сообщения от бота.\n"
+                "После выбора под текстом можно нажать кнопку *«Прослушать послание»*."
             ),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
@@ -527,6 +541,33 @@ async def select_card_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await send_card_to_chat(context.bot, query.from_user.id, card_id)
     except Exception as exc:
         logger.exception("Could not send selected card", exc_info=exc)
+
+
+async def voice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send voice reading only after a subscriber explicitly asks for it."""
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+
+    try:
+        card_id = int(query.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await query.answer("Не удалось открыть послание.", show_alert=True)
+        return
+
+    allowed, message = await require_channel_subscription(context.bot, query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+
+    await query.answer("Озвучиваю послание...")
+    try:
+        await send_card_voice(context.bot, query.from_user.id, card_id)
+    except Exception:
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="Не удалось озвучить послание. Попробуй нажать кнопку ещё раз чуть позже.",
+        )
 
 
 def review_keyboard(card_id: int) -> InlineKeyboardMarkup:
@@ -779,6 +820,7 @@ def main():
     application.add_handler(CommandHandler("editcard", editcard))
     application.add_handler(CommandHandler("clearcards", clearcards))
     application.add_handler(CommandHandler("review", review_cards))
+    application.add_handler(CallbackQueryHandler(voice_callback, pattern=r"^voice:"))
     application.add_handler(
         CallbackQueryHandler(select_card_callback, pattern=r"^(pick|card):")
     )
