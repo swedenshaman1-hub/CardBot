@@ -5,7 +5,7 @@ from pathlib import Path
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
-CARD_W, CARD_H = 300, 500
+CARD_W, CARD_H = 300, 533
 GAP = 20
 COLS = 3
 BADGE_SIZE = 72
@@ -58,11 +58,24 @@ def _load_image(url: str) -> Image.Image:
     return Image.open(BytesIO(resp.content)).convert("RGB")
 
 
+def _fit_card(image: Image.Image, size: tuple[int, int]) -> Image.Image:
+    """Resize and center-crop a card image without distortion."""
+    target_w, target_h = size
+    src_w, src_h = image.size
+    scale = max(target_w / src_w, target_h / src_h)
+    new_size = (round(src_w * scale), round(src_h * scale))
+    image = image.resize(new_size, Image.LANCZOS)
+
+    left = (image.width - target_w) // 2
+    top = (image.height - target_h) // 2
+    return image.crop((left, top, left + target_w, top + target_h))
+
+
 def build_collage(back_url: str | None, spread_id: int) -> str:
     """Build a 3×2 grid of face-down cards (rубашки) numbered 1-6."""
     if back_url:
         try:
-            card_back = _load_image(back_url).resize((CARD_W, CARD_H), Image.LANCZOS)
+            card_back = _fit_card(_load_image(back_url), (CARD_W, CARD_H))
         except Exception:
             card_back = _default_back(CARD_W, CARD_H)
     else:
@@ -84,15 +97,26 @@ def build_collage(back_url: str | None, spread_id: int) -> str:
 
         draw = ImageDraw.Draw(canvas)
 
-        # Dark strip at card bottom for number
-        draw.rectangle([x, y + CARD_H - 90, x + CARD_W, y + CARD_H], fill=(0, 0, 0))
-
         label = str(idx + 1)
         bbox = draw.textbbox((0, 0), label, font=font)
         tw = bbox[2] - bbox[0]
         th = bbox[3] - bbox[1]
+        badge = 86
+        badge_x = x + CARD_W // 2
+        badge_y = y + 64
+        draw.ellipse(
+            [
+                badge_x - badge // 2,
+                badge_y - badge // 2,
+                badge_x + badge // 2,
+                badge_y + badge // 2,
+            ],
+            fill=(0, 0, 0),
+            outline=(255, 255, 255),
+            width=4,
+        )
         draw.text(
-            (x + CARD_W / 2 - tw / 2 - bbox[0], y + CARD_H - 45 - th / 2 - bbox[1]),
+            (badge_x - tw / 2 - bbox[0], badge_y - th / 2 - bbox[1]),
             label,
             fill="white",
             font=font,
