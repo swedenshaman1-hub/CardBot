@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -28,6 +29,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 CHANNEL_ID = os.environ["CHANNEL_ID"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+MAX_CARDS_PER_SPREAD = 2
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,6 +37,48 @@ logger = logging.getLogger(__name__)
 
 def is_admin(update: Update) -> bool:
     return update.effective_user is not None and update.effective_user.id == ADMIN_ID
+
+
+def _member_has_channel_access(member) -> bool:
+    status = getattr(member, "status", "")
+    status = getattr(status, "value", status)
+    if status in {"creator", "administrator", "member"}:
+        return True
+    return status == "restricted" and bool(getattr(member, "is_member", False))
+
+
+async def is_channel_subscriber(bot, user_id: int) -> bool | None:
+    """True/False for membership; None when Telegram could not verify it."""
+    if user_id == ADMIN_ID:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        return _member_has_channel_access(member)
+    except BadRequest as exc:
+        if "member not found" in str(exc).lower() or "user not found" in str(exc).lower():
+            return False
+        logger.exception(
+            "Could not verify channel membership for %s", user_id, exc_info=exc
+        )
+        return None
+    except TelegramError as exc:
+        logger.exception(
+            "Could not verify channel membership for %s", user_id, exc_info=exc
+        )
+        return None
+
+
+async def require_channel_subscription(bot, user_id: int) -> tuple[bool, str | None]:
+    subscribed = await is_channel_subscriber(bot, user_id)
+    if subscribed is True:
+        return True, None
+    if subscribed is False:
+        return (
+            False,
+            "Расклад доступен только подписчикам канала. "
+            "Подпишись и нажми карту ещё раз.",
+        )
+    return False, "Не удалось проверить подписку. Попробуй ещё раз через минуту."
 
 
 def _gemini_tts(text: str) -> str:
@@ -319,16 +363,18 @@ async def newspread(update: Update, context: ContextTypes.DEFAULT_TYPE):
             photo=InputFile(f),
             caption=(
                 "🔮 *Карты дня*\n\n"
-                "Выбери свою карту — напиши её номер боту в личные сообщения."
+                "Выбери *две карты из шести* и нажми их номера ниже.\n"
+                "Расшифровку получают только подписчики канала.\n"
+                "После второго выбора остальные карты для тебя будут закрыты."
             ),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [
-                    InlineKeyboardButton(str(position), callback_data=f"card:{card_id}:{position}")
+                    InlineKeyboardButton(str(position), callback_data=f"pick:{spread_id}:{position}")
                     for position, card_id in enumerate(card_ids[:3], start=1)
                 ],
                 [
-                    InlineKeyboardButton(str(position), callback_data=f"card:{card_id}:{position}")
+                    InlineKeyboardButton(str(position), callback_data=f"pick:{spread_id}:{position}")
                     for position, card_id in enumerate(card_ids[3:], start=4)
                 ],
             ]),
@@ -356,6 +402,31 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("✨ Сегодня ещё не было расклада — загляни позже.")
         return
 
+    allowed, message = await require_channel_subscription(
+        context.bot, update.effective_user.id
+    )
+    if not allowed:
+        await update.message.reply_text(message)
+        return
+
+    claim = await asyncio.to_thread(
+        db.claim_spread_selection,
+        spread["id"],
+        update.effective_user.id,
+        position,
+        MAX_CARDS_PER_SPREAD,
+    )
+    if not claim["allowed"]:
+        await update.message.reply_text(
+            "Ты уже выбрал две карты в этом раскладе. Третью открыть нельзя."
+        )
+        return
+    if not claim["is_new"]:
+        await update.message.reply_text(
+            "Эту карту ты уже выбрал. Она входит в твои две карты дня."
+        )
+        return
+
     card_id = spread["card_ids"][position - 1]
     card = await asyncio.to_thread(db.get_card, card_id)
     if card is None:
@@ -366,27 +437,93 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def select_card_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle a click on a 1–6 button under the channel post."""
+    """Check subscription and enforce two card choices per published spread."""
     query = update.callback_query
-    if query is None or not query.data or not query.data.startswith("card:"):
+    if query is None or not query.data:
         return
 
-    _, card_id_text, _position = query.data.split(":", 2)
+    spread = None
+    position = None
+    if query.data.startswith("pick:"):
+        _, spread_id_text, position_text = query.data.split(":", 2)
+        try:
+            spread_id = int(spread_id_text)
+            position = int(position_text)
+        except ValueError:
+            await query.answer("Не удалось определить карту.", show_alert=True)
+            return
+        spread = await asyncio.to_thread(db.get_spread, spread_id)
+    elif query.data.startswith("card:"):
+        # Compatibility with buttons in posts published before this update.
+        _, legacy_card_id_text, position_text = query.data.split(":", 2)
+        try:
+            legacy_card_id = int(legacy_card_id_text)
+            position = int(position_text)
+        except ValueError:
+            await query.answer("Не удалось определить карту.", show_alert=True)
+            return
+        spread = await asyncio.to_thread(db.get_latest_spread)
+        if (
+            spread is None
+            or not 1 <= position <= len(spread["card_ids"])
+            or spread["card_ids"][position - 1] != legacy_card_id
+        ):
+            await query.answer(
+                "Этот расклад уже завершён. Выбери карту в новой публикации.",
+                show_alert=True,
+            )
+            return
+    else:
+        return
+
+    if spread is None or position is None or not 1 <= position <= len(spread["card_ids"]):
+        await query.answer("Этот расклад не найден.", show_alert=True)
+        return
+
+    allowed, message = await require_channel_subscription(context.bot, query.from_user.id)
+    if not allowed:
+        await query.answer(message, show_alert=True)
+        return
+
+    # A chat action is a quick, silent way to verify that the user started the
+    # bot before consuming one of the two choices.
     try:
-        card_id = int(card_id_text)
-    except ValueError:
-        await query.answer("Не удалось определить карту.", show_alert=True)
+        await context.bot.send_chat_action(query.from_user.id, "typing")
+    except TelegramError:
+        await query.answer(
+            "Сначала открой бота в личных сообщениях и нажми Start, "
+            "затем выбери карту снова.",
+            show_alert=True,
+        )
         return
 
-    await query.answer("Открываю карту…")
+    claim = await asyncio.to_thread(
+        db.claim_spread_selection,
+        spread["id"],
+        query.from_user.id,
+        position,
+        MAX_CARDS_PER_SPREAD,
+    )
+    if not claim["allowed"]:
+        await query.answer(
+            "Ты уже выбрал две карты в этом раскладе. Третью открыть нельзя.",
+            show_alert=True,
+        )
+        return
+    if not claim["is_new"]:
+        await query.answer(
+            "Эту карту ты уже выбрал. Она входит в твои две карты дня.",
+            show_alert=True,
+        )
+        return
+
+    card_id = spread["card_ids"][position - 1]
+    selected_count = len(claim["selections"])
+    await query.answer(f"Открываю карту {selected_count} из {MAX_CARDS_PER_SPREAD}…")
     try:
         await send_card_to_chat(context.bot, query.from_user.id, card_id)
     except Exception as exc:
         logger.exception("Could not send selected card", exc_info=exc)
-        await query.answer(
-            "Сначала открой бота в личных сообщениях и нажми Start, затем выбери карту снова.",
-            show_alert=True,
-        )
 
 
 def review_keyboard(card_id: int) -> InlineKeyboardMarkup:
@@ -587,8 +724,31 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔮 Добро пожаловать!\n\n"
         "Каждый день в канале появляются 6 карт.\n"
-        "Напиши цифру от 1 до 6 — получи своё напутствие дня."
+        "Подпишись на канал и выбери две карты из шести — "
+        "получишь их расшифровку и озвучку."
     )
+
+
+async def verify_runtime(application: Application):
+    """Log whether Telegram can use the configured chat for subscriptions."""
+    try:
+        me = await application.bot.get_me()
+        chat = await application.bot.get_chat(CHANNEL_ID)
+        member = await application.bot.get_chat_member(CHANNEL_ID, me.id)
+        logger.info(
+            "Card access target: bot=@%s chat_type=%s bot_status=%s",
+            me.username,
+            chat.type,
+            member.status,
+        )
+        if chat.type not in {"channel", "supergroup"}:
+            logger.error("CHANNEL_ID must point to a channel or supergroup")
+        if member.status not in {"creator", "administrator"}:
+            logger.warning(
+                "Bot should be an administrator for reliable membership checks"
+            )
+    except TelegramError as exc:
+        logger.exception("Card access startup check failed", exc_info=exc)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -597,7 +757,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     db.init_db()
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).post_init(verify_runtime).build()
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("newspread", newspread))
@@ -607,7 +767,9 @@ def main():
     application.add_handler(CommandHandler("editcard", editcard))
     application.add_handler(CommandHandler("clearcards", clearcards))
     application.add_handler(CommandHandler("review", review_cards))
-    application.add_handler(CallbackQueryHandler(select_card_callback, pattern=r"^card:"))
+    application.add_handler(
+        CallbackQueryHandler(select_card_callback, pattern=r"^(pick|card):")
+    )
     application.add_handler(CallbackQueryHandler(review_callback, pattern=r"^review"))
     application.add_handler(MessageHandler(filters.PHOTO, addcard))
     application.add_handler(MessageHandler(filters.Document.IMAGE, addcard_document))

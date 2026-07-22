@@ -1,3 +1,4 @@
+import json
 import os
 import time
 from datetime import datetime, timezone
@@ -115,6 +116,20 @@ def get_latest_spread() -> dict | None:
     }
 
 
+def get_spread(spread_id: int) -> dict | None:
+    client = get_client()
+    res = client.table("spreads").select("*").eq("id", spread_id).limit(1).execute()
+    if not res.data:
+        return None
+    row = res.data[0]
+    return {
+        "id": row["id"],
+        "created_at": row["created_at"],
+        "card_ids": row["card_ids"],
+        "channel_message_id": row["channel_message_id"],
+    }
+
+
 # ── settings ──────────────────────────────────────────────────────────────────
 
 def get_setting(key: str) -> str | None:
@@ -126,6 +141,44 @@ def get_setting(key: str) -> str | None:
 def set_setting(key: str, value: str):
     client = get_client()
     client.table("settings").upsert({"key": key, "value": value}).execute()
+
+
+def _spread_selection_key(spread_id: int, user_id: int) -> str:
+    return f"spread_selection:{spread_id}:{user_id}"
+
+
+def get_spread_selections(spread_id: int, user_id: int) -> list[int]:
+    """Return positions already opened by a user for one published spread."""
+    raw = get_setting(_spread_selection_key(spread_id, user_id))
+    if not raw:
+        return []
+    try:
+        values = json.loads(raw)
+        return sorted({int(value) for value in values if 1 <= int(value) <= 6})
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+
+
+def claim_spread_selection(
+    spread_id: int,
+    user_id: int,
+    position: int,
+    max_selections: int = 2,
+) -> dict:
+    """Persist one card choice and report whether it may be delivered."""
+    selections = get_spread_selections(spread_id, user_id)
+    if position in selections:
+        return {"allowed": True, "is_new": False, "selections": selections}
+    if len(selections) >= max_selections:
+        return {"allowed": False, "is_new": False, "selections": selections}
+
+    selections.append(position)
+    selections.sort()
+    set_setting(
+        _spread_selection_key(spread_id, user_id),
+        json.dumps(selections, separators=(",", ":")),
+    )
+    return {"allowed": True, "is_new": True, "selections": selections}
 
 
 def get_card_back_url() -> str | None:
