@@ -237,7 +237,7 @@ def spread_pick_keyboard(spread_id: int, card_ids: list[int]) -> InlineKeyboardM
 def spread_preview_keyboard(spread_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ Опубликовать в канал", callback_data=f"publish-spread:{spread_id}"),
+            InlineKeyboardButton("✅ Показать как в канале", callback_data=f"publish-spread:{spread_id}"),
             InlineKeyboardButton("✖️ Отменить", callback_data=f"cancel-spread:{spread_id}"),
         ]
     ])
@@ -420,7 +420,7 @@ async def newspread(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "👁 *Предпросмотр расклада*\n\n"
                 f"{spread_caption()}\n\n"
                 f"*Порядок карт для проверки:*\n{mapping}\n\n"
-                "Если всё верно, нажми *«Опубликовать в канал»*."
+                "Если всё верно, нажми *«Показать как в канале»*."
             ),
             parse_mode="Markdown",
             reply_markup=spread_preview_keyboard(spread_id),
@@ -468,7 +468,7 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
     try:
         with open(collage_path, "rb") as f:
             message = await context.bot.send_photo(
-                chat_id=CHANNEL_ID,
+                chat_id=query.message.chat_id,
                 photo=InputFile(f),
                 caption=spread_caption(),
                 parse_mode="Markdown",
@@ -478,14 +478,14 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
         os.remove(collage_path)
 
     await asyncio.to_thread(db.update_spread_message, spread_id, message.message_id)
-    await query.answer("Опубликовано в канал.")
+    await query.answer("Показал, как будет выглядеть в канале.")
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except TelegramError:
         pass
     await context.bot.send_message(
         chat_id=query.message.chat_id,
-        text=f"✅ Расклад #{spread_id} опубликован в канал.",
+        text=f"✅ Тестовая публикация расклада #{spread_id} показана в этом чате. В канал ничего не отправлено.",
     )
 
 
