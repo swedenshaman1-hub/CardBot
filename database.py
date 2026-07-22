@@ -104,10 +104,10 @@ def update_spread_message(spread_id: int, channel_message_id: int):
 
 def get_latest_spread() -> dict | None:
     client = get_client()
-    res = client.table("spreads").select("*").order("id", desc=True).limit(1).execute()
-    if not res.data:
+    res = client.table("spreads").select("*").order("id", desc=True).limit(20).execute()
+    row = next((item for item in res.data if item.get("channel_message_id")), None)
+    if row is None:
         return None
-    row = res.data[0]
     return {
         "id": row["id"],
         "created_at": row["created_at"],

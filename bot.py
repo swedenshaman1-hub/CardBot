@@ -209,6 +209,40 @@ def narrow_card_text(meaning: str, heading: str | None = None) -> str:
     return f"{heading}\n\n{meaning.strip()}" if heading else meaning.strip()
 
 
+def spread_caption() -> str:
+    return (
+        "🔮 *Карты дня*\n\n"
+        "Сегодня я выбрал для вас 6 карт-направлений.\n"
+        "Посмотрите на них и почувствуйте, какая карта сейчас откликается именно вам.\n\n"
+        "Чтобы получить карту дня, подпишитесь на канал и выберите *до двух карт из шести*.\n"
+        "Нажмите номер карты ниже — расшифровка придёт вам в личные сообщения от бота.\n"
+        "После выбора под текстом можно нажать кнопку *«Прослушать послание»*.\n\n"
+        "Если вам откликнулось послание, оставьте реакцию — пусть это будет наш энергообмен."
+    )
+
+
+def spread_pick_keyboard(spread_id: int, card_ids: list[int]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(str(position), callback_data=f"pick:{spread_id}:{position}")
+            for position, card_id in enumerate(card_ids[:3], start=1)
+        ],
+        [
+            InlineKeyboardButton(str(position), callback_data=f"pick:{spread_id}:{position}")
+            for position, card_id in enumerate(card_ids[3:], start=4)
+        ],
+    ])
+
+
+def spread_preview_keyboard(spread_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Опубликовать в канал", callback_data=f"publish-spread:{spread_id}"),
+            InlineKeyboardButton("✖️ Отменить", callback_data=f"cancel-spread:{spread_id}"),
+        ]
+    ])
+
+
 async def send_card_to_chat(bot, chat_id: int, card_id: int):
     """Send the original card image and text with an optional voice button."""
     card = await asyncio.to_thread(db.get_card, card_id)
@@ -373,34 +407,86 @@ async def newspread(update: Update, context: ContextTypes.DEFAULT_TYPE):
     back_url = await asyncio.to_thread(db.get_card_back_url)
     spread_id = await asyncio.to_thread(db.save_spread, card_ids)
     collage_path = await asyncio.to_thread(build_collage, back_url, spread_id)
+    mapping = "\n".join(
+        f"{position} → карта №{card_id}"
+        for position, card_id in enumerate(card_ids, start=1)
+    )
 
     with open(collage_path, "rb") as f:
-        message = await context.bot.send_photo(
-            chat_id=CHANNEL_ID,
+        await context.bot.send_photo(
+            chat_id=update.effective_chat.id,
             photo=InputFile(f),
             caption=(
-                "🔮 *Карты дня*\n\n"
-                "Чтобы получить карту дня, подпишись на канал и выбери *до двух карт из шести*.\n"
-                "Нажми номер карты ниже — расшифровка придёт тебе в личные сообщения от бота.\n"
-                "После выбора под текстом можно нажать кнопку *«Прослушать послание»*.\n\n"
-                "Если вам откликнулось послание, оставьте реакцию — пусть это будет наш энергообмен."
+                "👁 *Предпросмотр расклада*\n\n"
+                f"{spread_caption()}\n\n"
+                f"*Порядок карт для проверки:*\n{mapping}\n\n"
+                "Если всё верно, нажми *«Опубликовать в канал»*."
             ),
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(str(position), callback_data=f"pick:{spread_id}:{position}")
-                    for position, card_id in enumerate(card_ids[:3], start=1)
-                ],
-                [
-                    InlineKeyboardButton(str(position), callback_data=f"pick:{spread_id}:{position}")
-                    for position, card_id in enumerate(card_ids[3:], start=4)
-                ],
-            ]),
+            reply_markup=spread_preview_keyboard(spread_id),
         )
     os.remove(collage_path)
 
+    await update.message.reply_text("Предпросмотр готов. В канал ничего не отправлено.")
+
+
+async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query is None or not query.data or not is_admin(update):
+        return
+
+    action, spread_id_text = query.data.split(":", 1)
+    try:
+        spread_id = int(spread_id_text)
+    except ValueError:
+        await query.answer("Не удалось определить расклад.", show_alert=True)
+        return
+
+    spread = await asyncio.to_thread(db.get_spread, spread_id)
+    if spread is None:
+        await query.answer("Расклад не найден.", show_alert=True)
+        return
+
+    if action == "cancel-spread":
+        await query.answer("Публикация отменена.")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"Расклад #{spread_id} отменён. В канал ничего не отправлено.",
+        )
+        return
+
+    if spread.get("channel_message_id"):
+        await query.answer("Этот расклад уже опубликован.", show_alert=True)
+        return
+
+    back_url = await asyncio.to_thread(db.get_card_back_url)
+    collage_path = await asyncio.to_thread(build_collage, back_url, spread_id)
+    try:
+        with open(collage_path, "rb") as f:
+            message = await context.bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=InputFile(f),
+                caption=spread_caption(),
+                parse_mode="Markdown",
+                reply_markup=spread_pick_keyboard(spread_id, spread["card_ids"]),
+            )
+    finally:
+        os.remove(collage_path)
+
     await asyncio.to_thread(db.update_spread_message, spread_id, message.message_id)
-    await update.message.reply_text("✅ Расклад опубликован в канале.")
+    await query.answer("Опубликовано в канал.")
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=f"✅ Расклад #{spread_id} опубликован в канал.",
+    )
 
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -822,6 +908,9 @@ def main():
     application.add_handler(CommandHandler("clearcards", clearcards))
     application.add_handler(CommandHandler("review", review_cards))
     application.add_handler(CallbackQueryHandler(voice_callback, pattern=r"^voice:"))
+    application.add_handler(
+        CallbackQueryHandler(publish_spread_callback, pattern=r"^(publish|cancel)-spread:")
+    )
     application.add_handler(
         CallbackQueryHandler(select_card_callback, pattern=r"^(pick|card):")
     )
