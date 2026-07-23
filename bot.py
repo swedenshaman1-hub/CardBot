@@ -500,7 +500,6 @@ async def newspread(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=update.effective_chat.id,
             photo=InputFile(f),
             caption=(
-                "👁 *Предпросмотр расклада*\n\n"
                 f"{spread_caption()}\n\n"
                 f"*Порядок карт для проверки:*\n{mapping}\n\n"
                 "Если всё верно, нажми *«Опубликовать в канал»*."
@@ -510,7 +509,7 @@ async def newspread(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     os.remove(collage_path)
 
-    await update.message.reply_text("Предпросмотр готов. В канал ничего не отправлено.")
+    await update.message.reply_text("Расклад готов. В канал ничего не отправлено.")
 
 
 async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):

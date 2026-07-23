@@ -6,7 +6,7 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 
 CARD_W, CARD_H = 300, 533
-GAP = 20
+GAP = 10
 COLS = 3
 BADGE_SIZE = 72
 
@@ -101,9 +101,9 @@ def build_collage(back_url: str | None, spread_id: int) -> str:
         bbox = draw.textbbox((0, 0), label, font=font)
         tw = bbox[2] - bbox[0]
         th = bbox[3] - bbox[1]
-        badge = 86
+        badge = 80
         badge_x = x + CARD_W // 2
-        badge_y = y + 64
+        badge_y = y + 76
         draw.ellipse(
             [
                 badge_x - badge // 2,
