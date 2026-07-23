@@ -242,7 +242,6 @@ def spread_pick_keyboard(spread_id: int, card_ids: list[int]) -> InlineKeyboardM
             )
             for position, card_id in enumerate(card_ids[3:], start=4)
         ],
-        [InlineKeyboardButton("🔮 Открыть бота", url=BOT_LINK)],
     ])
 
 

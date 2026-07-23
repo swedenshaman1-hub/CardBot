@@ -5,8 +5,8 @@ from pathlib import Path
 import requests
 from PIL import Image, ImageDraw, ImageFont
 
-CARD_W, CARD_H = 300, 533
-GAP = 10
+CARD_W, CARD_H = 300, 450
+GAP = 8
 COLS = 3
 BADGE_SIZE = 72
 
