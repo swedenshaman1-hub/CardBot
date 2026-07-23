@@ -31,6 +31,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 CHANNEL_ID = os.environ["CHANNEL_ID"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+BOT_LINK = "https://t.me/shamankarty_bot"
 MAX_CARDS_PER_SPREAD = 2
 AUTO_DELETE_SECONDS = 72 * 60 * 60
 AUTO_DELETE_SETTING_PREFIX = "spread_auto_delete:"
@@ -218,8 +219,9 @@ def spread_caption() -> str:
         "🔮 *Карты дня*\n\n"
         "Сегодня я выбрал для вас 6 метафорических карт.\n"
         "Посмотрите на них и почувствуйте, какая карта сейчас откликается именно вам.\n\n"
-        "Чтобы получить своё послание дня, подпишитесь на канал и нажмите номер выбранной карты.\n"
+        "Чтобы получить своё послание дня, подпишитесь на канал и нажмите номер выбранной карты. Telegram откроет бота автоматически.\n"
         "Описание карты придёт вам в личные сообщения от бота.\n\n"
+        "Если вы ещё не запускали бота, нажмите Start.\n\n"
         "В каждой новой публикации вы можете открывать для себя две карты.\n\n"
         "Если вам откликнулось послание, оставьте реакцию — пусть это будет наш энергообмен."
     )
@@ -228,13 +230,20 @@ def spread_caption() -> str:
 def spread_pick_keyboard(spread_id: int, card_ids: list[int]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(str(position), callback_data=f"pick:{spread_id}:{position}")
+            InlineKeyboardButton(
+                str(position),
+                url=f"{BOT_LINK}?start=spread_{spread_id}_{position}",
+            )
             for position, card_id in enumerate(card_ids[:3], start=1)
         ],
         [
-            InlineKeyboardButton(str(position), callback_data=f"pick:{spread_id}:{position}")
+            InlineKeyboardButton(
+                str(position),
+                url=f"{BOT_LINK}?start=spread_{spread_id}_{position}",
+            )
             for position, card_id in enumerate(card_ids[3:], start=4)
         ],
+        [InlineKeyboardButton("🔮 Открыть бота", url=BOT_LINK)],
     ])
 
 
@@ -963,6 +972,52 @@ async def clearcards(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args:
+        token = context.args[0]
+        parts = token.split("_")
+        if len(parts) == 3 and parts[0] == "spread":
+            try:
+                spread_id = int(parts[1])
+                position = int(parts[2])
+            except ValueError:
+                spread_id = None
+                position = None
+
+            if spread_id is not None and position is not None:
+                spread = await asyncio.to_thread(db.get_spread, spread_id)
+                if spread is None or not 1 <= position <= len(spread["card_ids"]):
+                    await update.message.reply_text("Этот расклад уже недоступен.")
+                    return
+
+                allowed, message = await require_channel_subscription(
+                    context.bot, update.effective_user.id
+                )
+                if not allowed:
+                    await update.message.reply_text(message)
+                    return
+
+                claim = await asyncio.to_thread(
+                    db.claim_spread_selection,
+                    spread_id,
+                    update.effective_user.id,
+                    position,
+                    MAX_CARDS_PER_SPREAD,
+                )
+                if not claim["allowed"]:
+                    await update.message.reply_text(
+                        "Вы уже открыли две карты в этом раскладе. Третью открыть нельзя."
+                    )
+                    return
+                if not claim["is_new"]:
+                    await update.message.reply_text(
+                        "Эту карту вы уже открывали в этом раскладе."
+                    )
+                    return
+
+                card_id = spread["card_ids"][position - 1]
+                await send_card_to_chat(context.bot, update.effective_chat.id, card_id)
+                return
+
     await update.message.reply_text(
         "🔮 Добро пожаловать!\n\n"
         "Каждый день в канале появляются 6 карт.\n"
