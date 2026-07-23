@@ -59,17 +59,15 @@ def _load_image(url: str) -> Image.Image:
 
 
 def _fit_card(image: Image.Image, size: tuple[int, int]) -> Image.Image:
-    """Resize a card fully into the target frame without cropping."""
+    """Resize and crop a card to fill its frame without side borders."""
     target_w, target_h = size
     src_w, src_h = image.size
-    scale = min(target_w / src_w, target_h / src_h)
+    scale = max(target_w / src_w, target_h / src_h)
     new_size = (round(src_w * scale), round(src_h * scale))
     resized = image.resize(new_size, Image.LANCZOS)
-    canvas = Image.new("RGB", (target_w, target_h), (18, 8, 38))
-    left = (target_w - resized.width) // 2
-    top = (target_h - resized.height) // 2
-    canvas.paste(resized, (left, top))
-    return canvas
+    left = max(0, (resized.width - target_w) // 2)
+    top = max(0, (resized.height - target_h) // 2)
+    return resized.crop((left, top, left + target_w, top + target_h))
 
 
 def build_collage(back_url: str | None, spread_id: int) -> str:
