@@ -232,14 +232,14 @@ def spread_pick_keyboard(spread_id: int, card_ids: list[int]) -> InlineKeyboardM
         [
             InlineKeyboardButton(
                 str(position),
-                url=f"{BOT_LINK}?start=spread_{spread_id}_{position}",
+                callback_data=f"pick:{spread_id}:{position}",
             )
             for position, card_id in enumerate(card_ids[:3], start=1)
         ],
         [
             InlineKeyboardButton(
                 str(position),
-                url=f"{BOT_LINK}?start=spread_{spread_id}_{position}",
+                callback_data=f"pick:{spread_id}:{position}",
             )
             for position, card_id in enumerate(card_ids[3:], start=4)
         ],
@@ -686,6 +686,7 @@ async def select_card_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.answer("Не удалось определить карту.", show_alert=True)
             return
         spread = await asyncio.to_thread(db.get_latest_spread)
+        spread_id = spread["id"] if spread else None
         if (
             spread is None
             or not 1 <= position <= len(spread["card_ids"])
@@ -714,9 +715,8 @@ async def select_card_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await context.bot.send_chat_action(query.from_user.id, "typing")
     except TelegramError:
         await query.answer(
-            "Сначала открой бота в личных сообщениях и нажми Start, "
-            "затем выбери карту снова.",
-            show_alert=True,
+            "Откройте бота и нажмите Start — карта придёт автоматически.",
+            url=f"{BOT_LINK}?start=spread_{spread_id}_{position}",
         )
         return
 
