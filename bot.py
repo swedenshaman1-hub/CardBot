@@ -1,8 +1,10 @@
 import asyncio
 import base64
+import json
 import logging
 import os
 import tempfile
+import time
 import wave
 
 from dotenv import load_dotenv
@@ -30,6 +32,8 @@ ADMIN_ID = int(os.environ["ADMIN_ID"])
 CHANNEL_ID = os.environ["CHANNEL_ID"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 MAX_CARDS_PER_SPREAD = 2
+AUTO_DELETE_SECONDS = 48 * 60 * 60
+AUTO_DELETE_SETTING_PREFIX = "spread_auto_delete:"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -241,6 +245,76 @@ def spread_preview_keyboard(spread_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("✖️ Отменить", callback_data=f"cancel-spread:{spread_id}"),
         ]
     ])
+
+
+def _auto_delete_setting_key(spread_id: int) -> str:
+    return f"{AUTO_DELETE_SETTING_PREFIX}{spread_id}"
+
+
+async def delete_published_spread_later(
+    application: Application,
+    spread_id: int,
+    message_id: int,
+    delete_at: float,
+):
+    """Delete a channel post at its scheduled time and persist completion."""
+    delay = max(0, delete_at - time.time())
+    if delay:
+        await asyncio.sleep(delay)
+
+    try:
+        await application.bot.delete_message(chat_id=CHANNEL_ID, message_id=message_id)
+        logger.info("Automatically deleted spread %s from channel", spread_id)
+    except TelegramError as exc:
+        # Treat an already removed message as completed; otherwise keep the
+        # error visible in logs without crashing the polling process.
+        logger.warning("Could not automatically delete spread %s: %s", spread_id, exc)
+    finally:
+        await asyncio.to_thread(
+            db.set_setting,
+            _auto_delete_setting_key(spread_id),
+            "deleted",
+        )
+
+
+def schedule_spread_deletion(
+    application: Application,
+    spread_id: int,
+    message_id: int,
+    delete_at: float,
+):
+    tasks = application.bot_data.setdefault("spread_delete_tasks", {})
+    old_task = tasks.get(spread_id)
+    if old_task and not old_task.done():
+        old_task.cancel()
+    task = asyncio.create_task(
+        delete_published_spread_later(application, spread_id, message_id, delete_at)
+    )
+    tasks[spread_id] = task
+
+
+async def restore_scheduled_deletions(application: Application):
+    """Restore deletion timers after a Railway restart."""
+    records = await asyncio.to_thread(
+        db.get_settings_by_prefix,
+        AUTO_DELETE_SETTING_PREFIX,
+    )
+    restored = 0
+    for key, raw_value in records.items():
+        if raw_value == "deleted":
+            continue
+        try:
+            payload = json.loads(raw_value)
+            spread_id = int(key.split(":", 1)[1])
+            message_id = int(payload["message_id"])
+            delete_at = float(payload["delete_at"])
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+            logger.warning("Ignoring invalid auto-delete setting %s", key)
+            continue
+        schedule_spread_deletion(application, spread_id, message_id, delete_at)
+        restored += 1
+    if restored:
+        logger.info("Restored %s scheduled spread deletion(s)", restored)
 
 
 async def send_card_to_chat(bot, chat_id: int, card_id: int):
@@ -486,6 +560,16 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
         os.remove(collage_path)
 
     await asyncio.to_thread(db.update_spread_message, spread_id, message.message_id)
+    delete_at = time.time() + AUTO_DELETE_SECONDS
+    await asyncio.to_thread(
+        db.set_setting,
+        _auto_delete_setting_key(spread_id),
+        json.dumps(
+            {"message_id": message.message_id, "delete_at": delete_at},
+            separators=(",", ":"),
+        ),
+    )
+    schedule_spread_deletion(application=context.application, spread_id=spread_id, message_id=message.message_id, delete_at=delete_at)
     await query.answer("Расклад опубликован в канале.")
     try:
         await query.edit_message_reply_markup(reply_markup=None)
@@ -493,7 +577,7 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
         pass
     await context.bot.send_message(
         chat_id=query.message.chat_id,
-        text=f"✅ Расклад #{spread_id} опубликован в канале.",
+        text=f"✅ Расклад #{spread_id} опубликован в канале. Бот удалит этот пост через 48 часов.",
     )
 
 
@@ -897,6 +981,7 @@ async def verify_runtime(application: Application):
             logger.exception("Card access startup check failed", exc_info=exc)
     except TelegramError as exc:
         logger.exception("Card access startup check failed", exc_info=exc)
+    await restore_scheduled_deletions(application)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):

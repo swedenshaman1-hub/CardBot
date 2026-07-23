@@ -143,6 +143,13 @@ def set_setting(key: str, value: str):
     client.table("settings").upsert({"key": key, "value": value}).execute()
 
 
+def get_settings_by_prefix(prefix: str) -> dict[str, str]:
+    """Return settings whose keys start with the requested prefix."""
+    client = get_client()
+    res = client.table("settings").select("key,value").like("key", f"{prefix}%").execute()
+    return {row["key"]: row["value"] for row in res.data or []}
+
+
 def _spread_selection_key(spread_id: int, user_id: int) -> str:
     return f"spread_selection:{spread_id}:{user_id}"
 
