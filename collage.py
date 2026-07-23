@@ -6,7 +6,9 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 
 CARD_W, CARD_H = 300, 450
-GAP = 3
+# Cards slightly overlap so the dark outer edge of the photographed card
+# cannot form a visible stripe between neighboring cards.
+GAP = -2
 COLS = 3
 BADGE_SIZE = 72
 
@@ -59,8 +61,30 @@ def _load_image(url: str) -> Image.Image:
 
 
 def _fit_card(image: Image.Image, size: tuple[int, int]) -> Image.Image:
-    """Resize and crop a card to fill its frame without side borders."""
+    """Resize and crop a card to fill its frame without photo margins."""
     target_w, target_h = size
+
+    # The uploaded back is a photo of a card, so it may contain a dark
+    # background around the physical card. Remove only the outer dark side
+    # margins; otherwise those margins become black stripes in the collage.
+    gray = image.convert("L")
+    sample_top = round(image.height * 0.08)
+    sample_bottom = round(image.height * 0.92)
+    column_means = [
+        sum(gray.getpixel((x, y)) for y in range(sample_top, sample_bottom, 8))
+        / max(1, len(range(sample_top, sample_bottom, 8)))
+        for x in range(image.width)
+    ]
+    # The card artwork is substantially brighter than the dark studio
+    # background, so this threshold trims the photographed side margins.
+    threshold = 35
+    active = [x for x, mean in enumerate(column_means) if mean > threshold]
+    if active:
+        left = max(0, active[0] - 2)
+        right = min(image.width, active[-1] + 3)
+        if right - left >= image.width * 0.7:
+            image = image.crop((left, 0, right, image.height))
+
     src_w, src_h = image.size
     scale = max(target_w / src_w, target_h / src_h)
     new_size = (round(src_w * scale), round(src_h * scale))
@@ -82,16 +106,16 @@ def build_collage(back_url: str | None, spread_id: int) -> str:
 
     count = 6
     rows = -(-count // COLS)
-    width = COLS * CARD_W + (COLS + 1) * GAP
-    height = rows * CARD_H + (rows + 1) * GAP
+    width = COLS * CARD_W + (COLS - 1) * GAP
+    height = rows * CARD_H + (rows - 1) * GAP
 
-    canvas = Image.new("RGB", (width, height), (18, 8, 38))
+    canvas = Image.new("RGB", (width, height), (0, 0, 0))
     font = _font(BADGE_SIZE)
 
     for idx in range(count):
         col, row = idx % COLS, idx // COLS
-        x = GAP + col * (CARD_W + GAP)
-        y = GAP + row * (CARD_H + GAP)
+        x = col * (CARD_W + GAP)
+        y = row * (CARD_H + GAP)
         canvas.paste(card_back, (x, y))
 
         draw = ImageDraw.Draw(canvas)
