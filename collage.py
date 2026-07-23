@@ -6,7 +6,7 @@ import requests
 from PIL import Image, ImageDraw, ImageFont
 
 CARD_W, CARD_H = 300, 450
-GAP = 8
+GAP = 3
 COLS = 3
 BADGE_SIZE = 72
 
