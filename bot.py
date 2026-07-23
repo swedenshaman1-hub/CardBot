@@ -32,7 +32,7 @@ ADMIN_ID = int(os.environ["ADMIN_ID"])
 CHANNEL_ID = os.environ["CHANNEL_ID"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 MAX_CARDS_PER_SPREAD = 2
-AUTO_DELETE_SECONDS = 48 * 60 * 60
+AUTO_DELETE_SECONDS = 72 * 60 * 60
 AUTO_DELETE_SETTING_PREFIX = "spread_auto_delete:"
 
 logging.basicConfig(level=logging.INFO)
@@ -559,6 +559,25 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
     finally:
         os.remove(collage_path)
 
+    previous_spread = await asyncio.to_thread(db.get_latest_spread)
+    if previous_spread and previous_spread["id"] != spread_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=CHANNEL_ID,
+                message_id=previous_spread["channel_message_id"],
+            )
+            logger.info("Deleted previous spread %s before publishing %s", previous_spread["id"], spread_id)
+        except TelegramError as exc:
+            logger.warning("Could not delete previous spread %s: %s", previous_spread["id"], exc)
+        await asyncio.to_thread(
+            db.set_setting,
+            _auto_delete_setting_key(previous_spread["id"]),
+            "deleted",
+        )
+        old_task = context.application.bot_data.get("spread_delete_tasks", {}).pop(previous_spread["id"], None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+
     await asyncio.to_thread(db.update_spread_message, spread_id, message.message_id)
     delete_at = time.time() + AUTO_DELETE_SECONDS
     await asyncio.to_thread(
@@ -577,7 +596,7 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
         pass
     await context.bot.send_message(
         chat_id=query.message.chat_id,
-        text=f"✅ Расклад #{spread_id} опубликован в канале. Бот удалит этот пост через 48 часов.",
+        text=f"✅ Расклад #{spread_id} опубликован в канале. Бот удалит этот пост через 72 часа.",
     )
 
 
