@@ -103,17 +103,32 @@ def update_spread_message(spread_id: int, channel_message_id: int):
 
 
 def get_latest_spread() -> dict | None:
+    published = get_published_spreads()
+    return published[0] if published else None
+
+
+def get_published_spreads() -> list[dict]:
+    """Return every spread that still has a channel message attached."""
     client = get_client()
-    res = client.table("spreads").select("*").order("id", desc=True).limit(20).execute()
-    row = next((item for item in res.data if item.get("channel_message_id")), None)
-    if row is None:
-        return None
-    return {
-        "id": row["id"],
-        "created_at": row["created_at"],
-        "card_ids": row["card_ids"],
-        "channel_message_id": row["channel_message_id"],
-    }
+    res = client.table("spreads").select("*").order("id", desc=True).execute()
+    return [
+        {
+            "id": row["id"],
+            "created_at": row["created_at"],
+            "card_ids": row["card_ids"],
+            "channel_message_id": row["channel_message_id"],
+        }
+        for row in res.data
+        if row.get("channel_message_id")
+    ]
+
+
+def clear_spread_message(spread_id: int):
+    """Mark a channel post as removed so it is not retried unnecessarily."""
+    client = get_client()
+    client.table("spreads").update(
+        {"channel_message_id": None}
+    ).eq("id", spread_id).execute()
 
 
 def get_spread(spread_id: int) -> dict | None:

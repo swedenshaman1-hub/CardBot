@@ -565,16 +565,43 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
     finally:
         os.remove(collage_path)
 
-    previous_spread = await asyncio.to_thread(db.get_latest_spread)
-    if previous_spread and previous_spread["id"] != spread_id:
+    previous_spreads = await asyncio.to_thread(db.get_published_spreads)
+    for previous_spread in previous_spreads:
+        if previous_spread["id"] == spread_id:
+            continue
+
+        removed = False
         try:
             await context.bot.delete_message(
                 chat_id=CHANNEL_ID,
                 message_id=previous_spread["channel_message_id"],
             )
+            removed = True
             logger.info("Deleted previous spread %s before publishing %s", previous_spread["id"], spread_id)
+        except BadRequest as exc:
+            if "message to delete not found" in str(exc).lower():
+                # The post is already absent in Telegram. Clean the stale
+                # database reference exactly as after a successful deletion.
+                removed = True
+                logger.info(
+                    "Previous spread %s was already absent from the channel",
+                    previous_spread["id"],
+                )
+            else:
+                logger.warning(
+                    "Could not delete previous spread %s: %s",
+                    previous_spread["id"],
+                    exc,
+                )
         except TelegramError as exc:
             logger.warning("Could not delete previous spread %s: %s", previous_spread["id"], exc)
+
+        if not removed:
+            # Keep its database reference and deletion task so a temporary
+            # Telegram error does not permanently orphan the old post.
+            continue
+
+        await asyncio.to_thread(db.clear_spread_message, previous_spread["id"])
         await asyncio.to_thread(
             db.set_setting,
             _auto_delete_setting_key(previous_spread["id"]),
