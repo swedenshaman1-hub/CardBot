@@ -281,7 +281,8 @@ def _generate_spread_intro(cards: list[dict], recent_intros: list[str]) -> str:
         contents=prompt,
         config=genai_types.GenerateContentConfig(
             temperature=1.0,
-            max_output_tokens=350,
+            max_output_tokens=900,
+            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
         ),
     )
     intro = (response.text or "").strip().strip('"')
@@ -354,7 +355,8 @@ def _generate_spread_voice_script(
             contents=prompt,
             config=genai_types.GenerateContentConfig(
                 temperature=1.05,
-                max_output_tokens=500,
+                max_output_tokens=1200,
+                thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
             ),
         )
         last_text = (response.text or "").strip().strip('"')
