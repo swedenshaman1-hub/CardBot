@@ -392,6 +392,123 @@ def _generate_spread_voice_script(
     return last_text
 
 
+def _generate_reflection_question(card: dict) -> str:
+    """Create one admin-test question grounded in the original card meaning."""
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=genai_types.HttpOptions(timeout=60_000),
+    )
+    prompt = f"""
+Ты создаёшь один вопрос для закрытого теста Telegram-бота Дмитрия.
+
+Оригинальный смысл карты №{card["id"]}:
+{card.get("meaning", "").strip()[:1800]}
+
+Задача вопроса — помочь человеку связать смысл карты со своим текущим
+переживанием. Вопрос должен быть открытым, конкретным и отвечаемым в 1–3
+предложениях.
+
+Голос Дмитрия: живой, спокойный, прямой, на равных; внимание к настоящему
+моменту, чувствам, телу и личной ответственности.
+
+Запрещено:
+- ставить диагноз или называть скрытую причину;
+- утверждать наличие травмы, сценария, блока или родовой программы;
+- внушать воспоминания;
+- спрашивать сразу о нескольких вещах;
+- давить, обвинять или обещать исцеление;
+- использовать слова «Терапия Души», «метод» и «нейросеть».
+
+Верни только один вопрос, 12–28 слов, без заголовка и пояснений.
+""".strip()
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(
+            temperature=0.75,
+            max_output_tokens=250,
+            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+        ),
+    )
+    question = (response.text or "").strip().strip('"').replace("*", "")
+    if not question:
+        raise RuntimeError("Gemini returned an empty reflection question")
+    return question
+
+
+def _generate_safe_reflection(
+    card: dict, question: str, user_answer: str
+) -> str:
+    """Create one bounded reflection for the admin-only dialogue test."""
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=genai_types.HttpOptions(timeout=60_000),
+    )
+    prompt = f"""
+Ты — цифровой помощник Дмитрия в закрытом тесте. Подготовь один бережный
+разбор ответа человека, опираясь только на три источника ниже.
+
+1. Оригинальный смысл карты №{card["id"]}:
+{card.get("meaning", "").strip()[:1800]}
+
+2. Вопрос бота:
+{question}
+
+3. Дословный ответ человека:
+{user_answer[:1600]}
+
+Смысловая оптика:
+- «куда направлено внимание — туда движется переживание»;
+- различай внешний триггер и внутреннюю реакцию;
+- возвращай человеку авторство без обвинения;
+- замечай мысли, чувства и телесные ощущения здесь и сейчас;
+- предлагай точку наблюдения, а не готовую истину.
+
+Голос Дмитрия:
+- простой, живой, спокойный и прямой;
+- разговор на равных, без жалости и позиции спасателя;
+- можно использовать «похоже», «в твоём ответе слышится», «возможно»;
+- нельзя говорить от первого лица Дмитрия и нельзя выдавать текст за личную
+  консультацию Дмитрия.
+
+Строгие границы:
+- не ставь диагнозов;
+- не определяй травму, возраст события, мотивы других людей, родовые причины,
+  блоки, болезни или объективные факты;
+- не внушай воспоминаний и не утверждай причинно-следственную связь;
+- не пиши, что физический симптом точно вызван эмоцией;
+- не давай медицинских, юридических или финансовых советов;
+- не обещай результат и не используй мистические объяснения.
+
+Формат:
+- 100–150 слов;
+- 3 коротких абзаца;
+- сначала точно отрази то, что человек действительно написал;
+- затем покажи одну возможную связь с темой карты, обязательно как гипотезу;
+- закончи одним небольшим наблюдением или безопасным действием на сегодня;
+- не задавай второго вопроса;
+- не используй Markdown, заголовок и служебные пояснения.
+
+Если ответ содержит намерение причинить вред себе/другим, признаки острого
+кризиса или просьбу о диагнозе — вместо разбора напиши, что бот не может
+безопасно это разбирать и человеку нужна живая профессиональная помощь.
+""".strip()
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(
+            temperature=0.55,
+            max_output_tokens=900,
+            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+        ),
+    )
+    reflection = (response.text or "").strip().strip('"')
+    reflection = reflection.replace("*", "").replace("`", "")
+    if not reflection:
+        raise RuntimeError("Gemini returned an empty reflection")
+    return reflection
+
+
 def spread_caption(intro: str | None = None) -> str:
     return (
         "🔮 *Карты дня*\n\n"
@@ -1462,6 +1579,42 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
+    pending_reflection = context.user_data.get("pending_reflection_test")
+    if is_admin(update) and pending_reflection is not None:
+        if len(text) < 3:
+            await update.message.reply_text(
+                "Напишите ответ чуть подробнее — хотя бы одним предложением."
+            )
+            return
+        await update.message.reply_text("Собираю тестовый разбор…")
+        try:
+            card = await asyncio.to_thread(
+                db.get_card, int(pending_reflection["card_id"])
+            )
+            if card is None:
+                raise RuntimeError("Card not found")
+            reflection = await asyncio.to_thread(
+                _generate_safe_reflection,
+                card,
+                pending_reflection["question"],
+                text,
+            )
+        except Exception as exc:
+            logger.exception("Reflection test failed", exc_info=exc)
+            await update.message.reply_text(
+                "Не удалось подготовить тестовый разбор. Попробуйте ещё раз."
+            )
+            return
+        context.user_data.pop("pending_reflection_test", None)
+        await update.message.reply_text(
+            "🧭 <b>Тестовый разбор</b>\n\n"
+            f"{escape(reflection)}\n\n"
+            "<i>Это автоматическое отражение на основе карты и материалов "
+            "Дмитрия, а не диагностика и не личная консультация.</i>",
+            parse_mode="HTML",
+        )
+        return
+
     pending_schedule_id = context.user_data.get(
         "pending_schedule_spread_id"
     )
@@ -1781,6 +1934,46 @@ async def review_cards(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_review_card(context.bot, update.effective_chat.id, card_id, context)
 
 
+async def test_reflection_dialog(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """Start an admin-only card → question → answer → reflection test."""
+    if not is_admin(update):
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "Использование: <code>/testdialog 9</code>",
+            parse_mode="HTML",
+        )
+        return
+    card_id = int(context.args[0])
+    card = await asyncio.to_thread(db.get_card, card_id)
+    if card is None:
+        await update.message.reply_text(f"Карта №{card_id} не найдена.")
+        return
+    await update.message.reply_text("Готовлю вопрос для теста…")
+    try:
+        question = await asyncio.to_thread(_generate_reflection_question, card)
+    except Exception as exc:
+        logger.exception("Reflection question generation failed", exc_info=exc)
+        await update.message.reply_text(
+            "Не удалось подготовить вопрос. Попробуйте ещё раз."
+        )
+        return
+    context.user_data["pending_reflection_test"] = {
+        "card_id": card_id,
+        "question": question,
+    }
+    await update.message.reply_photo(photo=card["image_url"])
+    await update.message.reply_text(
+        f"🧪 <b>Закрытый тест карты №{card_id}</b>\n\n"
+        f"{escape(question)}\n\n"
+        "Ответьте на вопрос одним–тремя предложениями. Следующее ваше "
+        "текстовое сообщение бот использует только для тестового разбора.",
+        parse_mode="HTML",
+    )
+
+
 async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query is None or not is_admin(update):
@@ -1972,6 +2165,7 @@ def main():
     application.add_handler(CommandHandler("editcard", editcard))
     application.add_handler(CommandHandler("clearcards", clearcards))
     application.add_handler(CommandHandler("review", review_cards))
+    application.add_handler(CommandHandler("testdialog", test_reflection_dialog))
     application.add_handler(CallbackQueryHandler(voice_callback, pattern=r"^voice:"))
     application.add_handler(
         CallbackQueryHandler(
