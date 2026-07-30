@@ -449,6 +449,26 @@ def recorded_voice_preview_keyboard(spread_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+def spread_visual_preview_keyboard(spread_id: int) -> InlineKeyboardMarkup:
+    """Number buttons that look like the channel post but do not open cards."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                str(position),
+                callback_data=f"preview-position:{spread_id}:{position}",
+            )
+            for position in range(1, 4)
+        ],
+        [
+            InlineKeyboardButton(
+                str(position),
+                callback_data=f"preview-position:{spread_id}:{position}",
+            )
+            for position in range(4, 7)
+        ],
+    ])
+
+
 def _auto_delete_setting_key(spread_id: int) -> str:
     return f"{AUTO_DELETE_SETTING_PREFIX}{spread_id}"
 
@@ -651,24 +671,47 @@ async def handle_admin_voice(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     pending_spread_id = context.user_data.get("pending_spread_voice_id")
     if pending_spread_id is not None:
+        pending_spread_id = int(pending_spread_id)
         voice = update.message.voice
         await asyncio.to_thread(
             db.set_setting,
-            _spread_voice_key(int(pending_spread_id)),
+            _spread_voice_key(pending_spread_id),
             voice.file_id,
         )
         context.user_data.pop("pending_spread_voice_id", None)
         await update.message.reply_text(
-            "👁 <b>Предпросмотр голосового послания</b>\n\n"
-            "В канале оно появится сразу под публикацией с картами. "
-            "Прослушайте запись и только после этого подтвердите публикацию.",
+            "👁 <b>Полный предпросмотр публикации</b>\n\n"
+            "Ниже показано именно то, как публикация будет выглядеть в канале. "
+            "Цифры в этом предпросмотре отключены.",
             parse_mode="HTML",
         )
+        spread = await asyncio.to_thread(db.get_spread, pending_spread_id)
+        intro = await asyncio.to_thread(
+            db.get_setting, _spread_intro_key(pending_spread_id)
+        )
+        back_url = await asyncio.to_thread(db.get_card_back_url)
+        collage_path = await asyncio.to_thread(
+            build_collage, back_url, pending_spread_id
+        )
+        try:
+            with open(collage_path, "rb") as preview_image:
+                photo_preview = await context.bot.send_photo(
+                    chat_id=update.effective_chat.id,
+                    photo=InputFile(preview_image),
+                    caption=spread_caption(intro),
+                    parse_mode="Markdown",
+                    reply_markup=spread_visual_preview_keyboard(
+                        pending_spread_id
+                    ),
+                )
+        finally:
+            os.remove(collage_path)
         await context.bot.send_voice(
             chat_id=update.effective_chat.id,
             voice=voice.file_id,
             caption="🎙 Личное послание Дмитрия к сегодняшним картам",
-            reply_markup=recorded_voice_preview_keyboard(int(pending_spread_id)),
+            reply_to_message_id=photo_preview.message_id,
+            reply_markup=recorded_voice_preview_keyboard(pending_spread_id),
         )
         return
 
@@ -830,6 +873,17 @@ async def record_spread_voice_callback(
         ),
         parse_mode="HTML",
     )
+
+
+async def preview_position_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    if query is not None:
+        await query.answer(
+            "Это предпросмотр. В канале эта кнопка откроет выбранную карту.",
+            show_alert=False,
+        )
 
 
 async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1492,6 +1546,12 @@ def main():
         CallbackQueryHandler(
             record_spread_voice_callback,
             pattern=r"^record-spread:",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            preview_position_callback,
+            pattern=r"^preview-position:",
         )
     )
     application.add_handler(
