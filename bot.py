@@ -6,6 +6,7 @@ import os
 import tempfile
 import time
 import wave
+from html import escape
 
 from dotenv import load_dotenv
 from google import genai
@@ -36,6 +37,7 @@ MAX_CARDS_PER_SPREAD = 2
 AUTO_DELETE_SECONDS = 72 * 60 * 60
 AUTO_DELETE_SETTING_PREFIX = "spread_auto_delete:"
 SPREAD_INTRO_SETTING_PREFIX = "spread_intro:"
+SPREAD_VOICE_SCRIPT_PREFIX = "spread_voice_script:"
 SPREAD_VOICE_SETTING_PREFIX = "spread_voice:"
 SPREAD_CHANNEL_VOICE_PREFIX = "spread_channel_voice:"
 
@@ -225,6 +227,10 @@ def _spread_voice_key(spread_id: int) -> str:
     return f"{SPREAD_VOICE_SETTING_PREFIX}{spread_id:010d}"
 
 
+def _spread_voice_script_key(spread_id: int) -> str:
+    return f"{SPREAD_VOICE_SCRIPT_PREFIX}{spread_id:010d}"
+
+
 def _spread_channel_voice_key(spread_id: int) -> str:
     return f"{SPREAD_CHANNEL_VOICE_PREFIX}{spread_id:010d}"
 
@@ -288,6 +294,84 @@ def _generate_spread_intro(cards: list[dict], recent_intros: list[str]) -> str:
     return intro
 
 
+def _generate_spread_voice_script(
+    cards: list[dict], recent_scripts: list[str]
+) -> str:
+    """Create a 30–40 second personal script for Dmitry to record."""
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=genai_types.HttpOptions(timeout=60_000),
+    )
+    card_context = "\n".join(
+        f"- Карта №{card['id']}: {card.get('meaning', '').strip()[:1100]}"
+        for card in cards
+    )
+    recent_context = "\n\n---\n\n".join(recent_scripts[-7:]) or "Нет предыдущих текстов."
+    prompt = f"""
+Ты создаёшь личное голосовое вступление Дмитрия к ежедневному раскладу
+«Карты дня». Дмитрий прочитает этот текст своим голосом.
+
+Перед финальным ответом молча проведи текст через редакционную команду:
+1. Методолог «Терапии Души» — карта не предсказывает будущее, а возвращает
+   внимание к телу, чувствам, мыслям, авторству и внутренней опоре.
+2. Редактор голоса Дмитрия — сердечность, живое присутствие, простота,
+   уверенность, отсутствие осуждения и разговора сверху.
+3. Joanna Wiebe — сильный, ясный хук на языке реального переживания человека.
+4. Ann Handley — человеческая интонация, конкретность и ощущение разговора
+   с одним человеком, а не с безликой аудиторией.
+5. Rory Sutherland — свежий смысловой угол без искажения значений карт.
+6. Cialdini и Sandel — этическая проверка: никакого давления, страха,
+   искусственного дефицита, манипуляции болью и ложных обещаний.
+
+Формат обязателен:
+- первая строка — короткий цепляющий заголовок-хук из 4–8 слов;
+- затем пустая строка и связный текст;
+- весь текст 75–95 слов: это 30–40 секунд спокойной речи;
+- 3 коротких абзаца;
+- один точный вопрос, который помогает человеку прислушаться к себе;
+- финал — мягкое приглашение выбрать одну из шести карт.
+
+Голос Дмитрия: живой, тёплый, уверенный, сердечный, без пафоса. Должно
+чувствоваться, что он лично выбрал карты и сейчас говорит с одним человеком.
+Найди общий смысловой нерв шести карт, но не раскрывай карты и не называй номера.
+
+Запрещено: предсказания, диагнозы, давление, обещания результата, мистический
+туман, «Вселенная посылает знак», «это неслучайно», канцелярит и рекламные штампы.
+Не повторяй заголовки, вопросы, начало и образ из недавних текстов.
+Выдай только готовый текст. Не ставь кавычки, Markdown и пояснения.
+
+Сегодняшние карты:
+{card_context}
+
+Недавние сценарии, которые нельзя повторять:
+{recent_context}
+""".strip()
+
+    last_text = ""
+    for _ in range(3):
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=1.05,
+                max_output_tokens=500,
+            ),
+        )
+        last_text = (response.text or "").strip().strip('"')
+        last_text = last_text.replace("*", "").replace("`", "").replace("_", "")
+        word_count = len(last_text.split())
+        if 65 <= word_count <= 110 and "\n" in last_text:
+            return last_text
+        prompt += (
+            f"\n\nПредыдущая попытка содержала {word_count} слов. "
+            "Перепиши полностью и строго соблюди объём 75–95 слов."
+        )
+
+    if len(last_text.split()) < 50:
+        raise RuntimeError("Gemini returned a voice script that is too short")
+    return last_text
+
+
 def spread_caption(intro: str | None = None) -> str:
     opening = (
         intro.strip()
@@ -344,6 +428,21 @@ def spread_preview_keyboard(
         [
             InlineKeyboardButton("✅ Опубликовать в канал", callback_data=f"publish-spread:{spread_id}"),
             InlineKeyboardButton("✖️ Отменить", callback_data=f"cancel-spread:{spread_id}"),
+        ]
+    ])
+
+
+def recorded_voice_preview_keyboard(spread_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ Опубликовать в канал",
+                callback_data=f"publish-spread:{spread_id}",
+            ),
+            InlineKeyboardButton(
+                "🔁 Перезаписать",
+                callback_data=f"record-spread:{spread_id}",
+            ),
         ]
     ])
 
@@ -558,8 +657,16 @@ async def handle_admin_voice(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         context.user_data.pop("pending_spread_voice_id", None)
         await update.message.reply_text(
-            f"✅ Ваше голосовое послание сохранено для расклада #{pending_spread_id}.\n\n"
-            "Теперь можно вернуться к предпросмотру и нажать «Опубликовать в канал»."
+            "👁 <b>Предпросмотр голосового послания</b>\n\n"
+            "В канале оно появится сразу под публикацией с картами. "
+            "Прослушайте запись и только после этого подтвердите публикацию.",
+            parse_mode="HTML",
+        )
+        await context.bot.send_voice(
+            chat_id=update.effective_chat.id,
+            voice=voice.file_id,
+            caption="🎙 Личное послание Дмитрия к сегодняшним картам",
+            reply_markup=recorded_voice_preview_keyboard(int(pending_spread_id)),
         )
         return
 
@@ -671,18 +778,51 @@ async def record_spread_voice_callback(
         await query.answer("Расклад не найден.", show_alert=True)
         return
 
-    intro = await asyncio.to_thread(db.get_setting, _spread_intro_key(spread_id))
-    if not intro:
-        await query.answer("Текст для озвучивания не найден.", show_alert=True)
-        return
+    await query.answer("Готовлю текст на 30–40 секунд…")
+    script = await asyncio.to_thread(
+        db.get_setting, _spread_voice_script_key(spread_id)
+    )
+    if not script:
+        cards, missing = await asyncio.to_thread(
+            db.get_cards, spread["card_ids"]
+        )
+        if missing:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=f"❌ Не найдены карты: {missing}",
+            )
+            return
+        recent_scripts = await asyncio.to_thread(
+            db.get_recent_settings, SPREAD_VOICE_SCRIPT_PREFIX, 7
+        )
+        try:
+            script = await asyncio.to_thread(
+                _generate_spread_voice_script,
+                cards,
+                recent_scripts,
+            )
+        except Exception as exc:
+            logger.exception("Could not generate author voice script", exc_info=exc)
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="❌ Не удалось подготовить текст. Нажмите кнопку ещё раз.",
+            )
+            return
+        await asyncio.to_thread(
+            db.set_setting,
+            _spread_voice_script_key(spread_id),
+            script,
+        )
 
     context.user_data["pending_spread_voice_id"] = spread_id
-    await query.answer("Жду ваше голосовое сообщение.")
+    script_parts = script.split("\n", 1)
+    hook = escape(script_parts[0].strip())
+    body = escape(script_parts[1].strip()) if len(script_parts) > 1 else ""
     await context.bot.send_message(
         chat_id=query.message.chat_id,
         text=(
             "🎙 <b>Текст для вашего голосового послания:</b>\n\n"
-            f"{intro}\n\n"
+            f"<b>{hook}</b>\n\n{body}\n\n"
             "<b>Теперь запишите и отправьте сюда голосовое сообщение.</b>\n"
             "Можно читать не дословно — главное сохранить этот смысл и говорить от себя."
         ),
@@ -723,6 +863,16 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.answer("Этот расклад уже опубликован.", show_alert=True)
         return
 
+    voice_file_id = await asyncio.to_thread(
+        db.get_setting, _spread_voice_key(spread_id)
+    )
+    if not voice_file_id:
+        await query.answer(
+            "Сначала нажмите «Записать моё послание» и отправьте голосовое.",
+            show_alert=True,
+        )
+        return
+
     back_url = await asyncio.to_thread(db.get_card_back_url)
     intro = await asyncio.to_thread(db.get_setting, _spread_intro_key(spread_id))
     collage_path = await asyncio.to_thread(build_collage, back_url, spread_id)
@@ -746,28 +896,38 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
     finally:
         os.remove(collage_path)
 
-    voice_file_id = await asyncio.to_thread(
-        db.get_setting, _spread_voice_key(spread_id)
-    )
-    if voice_file_id:
+    try:
+        voice_message = await context.bot.send_voice(
+            chat_id=CHANNEL_ID,
+            voice=voice_file_id,
+            caption="🎙 Личное послание Дмитрия к сегодняшним картам",
+            reply_to_message_id=message.message_id,
+        )
+        await asyncio.to_thread(
+            db.set_setting,
+            _spread_channel_voice_key(spread_id),
+            str(voice_message.message_id),
+        )
+    except TelegramError as exc:
+        logger.exception(
+            "Could not publish author voice for spread %s: %s",
+            spread_id,
+            exc,
+        )
         try:
-            voice_message = await context.bot.send_voice(
+            await context.bot.delete_message(
                 chat_id=CHANNEL_ID,
-                voice=voice_file_id,
-                caption="🎙 Личное послание Дмитрия к сегодняшним картам",
-                reply_to_message_id=message.message_id,
+                message_id=message.message_id,
             )
-            await asyncio.to_thread(
-                db.set_setting,
-                _spread_channel_voice_key(spread_id),
-                str(voice_message.message_id),
+        except TelegramError:
+            logger.exception(
+                "Could not roll back photo post for spread %s", spread_id
             )
-        except TelegramError as exc:
-            logger.warning(
-                "Spread %s published, but author voice could not be sent: %s",
-                spread_id,
-                exc,
-            )
+        await query.answer(
+            "Голос не отправился. Публикация отменена, попробуйте ещё раз.",
+            show_alert=True,
+        )
+        return
 
     previous_spreads = await asyncio.to_thread(db.get_published_spreads)
     for previous_spread in previous_spreads:
