@@ -482,7 +482,7 @@ async def send_complete_spread_preview(
     collage_path = await asyncio.to_thread(build_collage, back_url, spread_id)
     try:
         with open(collage_path, "rb") as preview_image:
-            photo_preview = await context.bot.send_photo(
+            await context.bot.send_photo(
                 chat_id=chat_id,
                 photo=InputFile(preview_image),
                 caption=spread_caption(intro),
@@ -495,8 +495,7 @@ async def send_complete_spread_preview(
     await context.bot.send_voice(
         chat_id=chat_id,
         voice=voice_file_id,
-        caption="🎙 Личное послание Дмитрия к сегодняшним картам",
-        reply_to_message_id=photo_preview.message_id,
+        caption="🎙 Моё личное послание к сегодняшним картам",
         reply_markup=recorded_voice_preview_keyboard(spread_id),
     )
 
@@ -998,8 +997,7 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
         voice_message = await context.bot.send_voice(
             chat_id=CHANNEL_ID,
             voice=voice_file_id,
-            caption="🎙 Личное послание Дмитрия к сегодняшним картам",
-            reply_to_message_id=message.message_id,
+            caption="🎙 Моё личное послание к сегодняшним картам",
         )
         await asyncio.to_thread(
             db.set_setting,
