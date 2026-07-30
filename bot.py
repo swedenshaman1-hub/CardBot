@@ -3,10 +3,13 @@ import base64
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 import wave
+from datetime import datetime, timedelta
 from html import escape
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from google import genai
@@ -40,6 +43,8 @@ SPREAD_INTRO_SETTING_PREFIX = "spread_intro:"
 SPREAD_VOICE_SCRIPT_PREFIX = "spread_voice_script:"
 SPREAD_VOICE_SETTING_PREFIX = "spread_voice:"
 SPREAD_CHANNEL_VOICE_PREFIX = "spread_channel_voice:"
+SCHEDULED_SPREAD_PREFIX = "scheduled_spread:"
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -233,6 +238,10 @@ def _spread_voice_script_key(spread_id: int) -> str:
 
 def _spread_channel_voice_key(spread_id: int) -> str:
     return f"{SPREAD_CHANNEL_VOICE_PREFIX}{spread_id:010d}"
+
+
+def _scheduled_spread_key(spread_id: int) -> str:
+    return f"{SCHEDULED_SPREAD_PREFIX}{spread_id:010d}"
 
 
 def _generate_spread_intro(cards: list[dict], recent_intros: list[str]) -> str:
@@ -436,7 +445,10 @@ def spread_preview_keyboard(
             )
         ],
         [
-            InlineKeyboardButton("✅ Опубликовать в канал", callback_data=f"publish-spread:{spread_id}"),
+            InlineKeyboardButton("✅ Опубликовать сейчас", callback_data=f"publish-spread:{spread_id}"),
+            InlineKeyboardButton("🕗 Запланировать", callback_data=f"schedule-spread:{spread_id}"),
+        ],
+        [
             InlineKeyboardButton("✖️ Отменить", callback_data=f"cancel-spread:{spread_id}"),
         ]
     ])
@@ -446,9 +458,15 @@ def recorded_voice_preview_keyboard(spread_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "✅ Опубликовать в канал",
+                "✅ Опубликовать сейчас",
                 callback_data=f"publish-spread:{spread_id}",
             ),
+            InlineKeyboardButton(
+                "🕗 Запланировать",
+                callback_data=f"schedule-spread:{spread_id}",
+            ),
+        ],
+        [
             InlineKeyboardButton(
                 "🔁 Перезаписать",
                 callback_data=f"record-spread:{spread_id}",
@@ -801,7 +819,7 @@ async def newspread(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=(
                 f"{spread_caption()}\n\n"
                 f"*Порядок карт для проверки:*\n{mapping}\n\n"
-                "Если всё верно, нажми *«Опубликовать в канал»*."
+                "Если всё верно, опубликуй сейчас или запланируй дату и время."
             ),
             parse_mode="Markdown",
             reply_markup=spread_preview_keyboard(spread_id),
@@ -936,6 +954,306 @@ async def show_complete_preview_callback(
     )
 
 
+async def publish_scheduled_spread(
+    application: Application,
+    spread_id: int,
+    admin_chat_id: int | None = None,
+):
+    """Publish one prepared spread without a live callback query."""
+    spread = await asyncio.to_thread(db.get_spread, spread_id)
+    if spread is None or spread.get("channel_message_id"):
+        return
+
+    voice_file_id = await asyncio.to_thread(
+        db.get_setting, _spread_voice_key(spread_id)
+    )
+    if not voice_file_id:
+        raise RuntimeError(f"Spread #{spread_id} has no author voice")
+
+    back_url = await asyncio.to_thread(db.get_card_back_url)
+    collage_path = await asyncio.to_thread(build_collage, back_url, spread_id)
+    try:
+        with open(collage_path, "rb") as image:
+            message = await application.bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=InputFile(image),
+                caption=spread_caption(),
+                parse_mode="Markdown",
+                reply_markup=spread_pick_keyboard(
+                    spread_id, spread["card_ids"]
+                ),
+            )
+    finally:
+        os.remove(collage_path)
+
+    try:
+        voice_message = await application.bot.send_voice(
+            chat_id=CHANNEL_ID,
+            voice=voice_file_id,
+            caption="🎙 Моё личное послание к сегодняшним картам",
+        )
+    except TelegramError:
+        try:
+            await application.bot.delete_message(
+                chat_id=CHANNEL_ID,
+                message_id=message.message_id,
+            )
+        except TelegramError:
+            logger.exception(
+                "Could not roll back scheduled photo post %s", spread_id
+            )
+        raise
+
+    await asyncio.to_thread(
+        db.set_setting,
+        _spread_channel_voice_key(spread_id),
+        str(voice_message.message_id),
+    )
+
+    previous_spreads = await asyncio.to_thread(db.get_published_spreads)
+    for previous_spread in previous_spreads:
+        if previous_spread["id"] == spread_id:
+            continue
+        previous_voice_id = await asyncio.to_thread(
+            db.get_setting,
+            _spread_channel_voice_key(previous_spread["id"]),
+        )
+        if previous_voice_id and previous_voice_id != "deleted":
+            try:
+                await application.bot.delete_message(
+                    chat_id=CHANNEL_ID,
+                    message_id=int(previous_voice_id),
+                )
+            except (TelegramError, ValueError):
+                logger.exception(
+                    "Could not remove old scheduled voice for spread %s",
+                    previous_spread["id"],
+                )
+            await asyncio.to_thread(
+                db.set_setting,
+                _spread_channel_voice_key(previous_spread["id"]),
+                "deleted",
+            )
+        try:
+            await application.bot.delete_message(
+                chat_id=CHANNEL_ID,
+                message_id=previous_spread["channel_message_id"],
+            )
+        except BadRequest as exc:
+            if "message to delete not found" not in str(exc).lower():
+                logger.exception(
+                    "Could not remove old scheduled spread %s",
+                    previous_spread["id"],
+                )
+                continue
+        except TelegramError:
+            logger.exception(
+                "Could not remove old scheduled spread %s",
+                previous_spread["id"],
+            )
+            continue
+        await asyncio.to_thread(
+            db.clear_spread_message, previous_spread["id"]
+        )
+        await asyncio.to_thread(
+            db.set_setting,
+            _auto_delete_setting_key(previous_spread["id"]),
+            "deleted",
+        )
+        old_task = application.bot_data.get(
+            "spread_delete_tasks", {}
+        ).pop(previous_spread["id"], None)
+        if old_task and not old_task.done():
+            old_task.cancel()
+
+    await asyncio.to_thread(
+        db.update_spread_message, spread_id, message.message_id
+    )
+    delete_at = time.time() + AUTO_DELETE_SECONDS
+    await asyncio.to_thread(
+        db.set_setting,
+        _auto_delete_setting_key(spread_id),
+        json.dumps(
+            {"message_id": message.message_id, "delete_at": delete_at},
+            separators=(",", ":"),
+        ),
+    )
+    schedule_spread_deletion(
+        application, spread_id, message.message_id, delete_at
+    )
+    await asyncio.to_thread(
+        db.set_setting, _scheduled_spread_key(spread_id), "published"
+    )
+    if admin_chat_id:
+        await application.bot.send_message(
+            chat_id=admin_chat_id,
+            text=(
+                f"✅ Запланированный расклад #{spread_id} опубликован "
+                "в канале."
+            ),
+        )
+
+
+async def scheduled_publish_worker(
+    application: Application,
+    spread_id: int,
+    publish_at: float,
+    admin_chat_id: int | None,
+):
+    delay = max(0, publish_at - time.time())
+    if delay:
+        await asyncio.sleep(delay)
+    try:
+        await publish_scheduled_spread(
+            application, spread_id, admin_chat_id
+        )
+    except Exception as exc:
+        logger.exception(
+            "Scheduled publication failed for spread %s", spread_id,
+            exc_info=exc,
+        )
+        await asyncio.to_thread(
+            db.set_setting, _scheduled_spread_key(spread_id), "failed"
+        )
+        if admin_chat_id:
+            await application.bot.send_message(
+                chat_id=admin_chat_id,
+                text=(
+                    f"❌ Не удалось опубликовать запланированный расклад "
+                    f"#{spread_id}. Откройте его и попробуйте ещё раз."
+                ),
+            )
+
+
+def schedule_spread_publication(
+    application: Application,
+    spread_id: int,
+    publish_at: float,
+    admin_chat_id: int | None,
+):
+    tasks = application.bot_data.setdefault("spread_publish_tasks", {})
+    old_task = tasks.get(spread_id)
+    if old_task and not old_task.done():
+        old_task.cancel()
+    tasks[spread_id] = asyncio.create_task(
+        scheduled_publish_worker(
+            application, spread_id, publish_at, admin_chat_id
+        )
+    )
+
+
+def parse_moscow_schedule(text: str) -> datetime:
+    """Parse 'завтра 08:00', '31.07 08:00', or '08:00' in Moscow time."""
+    value = " ".join(text.lower().replace(",", " ").split())
+    now = datetime.now(MOSCOW_TZ)
+
+    tomorrow_match = re.fullmatch(
+        r"завтра\s+([01]?\d|2[0-3]):([0-5]\d)", value
+    )
+    if tomorrow_match:
+        hour, minute = map(int, tomorrow_match.groups())
+        day = (now + timedelta(days=1)).date()
+        return datetime(
+            day.year, day.month, day.day, hour, minute, tzinfo=MOSCOW_TZ
+        )
+
+    date_match = re.fullmatch(
+        r"(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?\s+"
+        r"([01]?\d|2[0-3]):([0-5]\d)",
+        value,
+    )
+    if date_match:
+        day, month, year, hour, minute = date_match.groups()
+        year_value = int(year) if year else now.year
+        result = datetime(
+            year_value,
+            int(month),
+            int(day),
+            int(hour),
+            int(minute),
+            tzinfo=MOSCOW_TZ,
+        )
+        if not year and result <= now:
+            result = result.replace(year=now.year + 1)
+        return result
+
+    time_match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", value)
+    if time_match:
+        hour, minute = map(int, time_match.groups())
+        result = now.replace(
+            hour=hour, minute=minute, second=0, microsecond=0
+        )
+        if result <= now:
+            result += timedelta(days=1)
+        return result
+
+    raise ValueError("Unsupported schedule format")
+
+
+async def schedule_spread_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    if query is None or not query.data or not is_admin(update):
+        return
+    try:
+        spread_id = int(query.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await query.answer("Не удалось определить расклад.", show_alert=True)
+        return
+
+    spread = await asyncio.to_thread(db.get_spread, spread_id)
+    voice_file_id = await asyncio.to_thread(
+        db.get_setting, _spread_voice_key(spread_id)
+    )
+    if spread is None or spread.get("channel_message_id"):
+        await query.answer("Расклад недоступен для планирования.", show_alert=True)
+        return
+    if not voice_file_id:
+        await query.answer(
+            "Сначала запишите голосовое послание.", show_alert=True
+        )
+        return
+
+    context.user_data["pending_schedule_spread_id"] = spread_id
+    await query.answer("Жду дату и время.")
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=(
+            "🕗 <b>Когда опубликовать расклад?</b>\n\n"
+            "Отправьте время по Москве в одном из форматов:\n"
+            "• <code>завтра 08:00</code>\n"
+            "• <code>31.07 08:00</code>\n"
+            "• <code>08:00</code> — ближайшее такое время\n\n"
+            "После этого бот сохранит расписание и покажет подтверждение."
+        ),
+        parse_mode="HTML",
+    )
+
+
+async def restore_scheduled_publications(application: Application):
+    records = await asyncio.to_thread(
+        db.get_settings_by_prefix, SCHEDULED_SPREAD_PREFIX
+    )
+    restored = 0
+    for key, raw_value in records.items():
+        if raw_value in {"published", "cancelled", "failed"}:
+            continue
+        try:
+            payload = json.loads(raw_value)
+            spread_id = int(key.rsplit(":", 1)[1])
+            publish_at = float(payload["publish_at"])
+            admin_chat_id = int(payload["admin_chat_id"])
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+            continue
+        schedule_spread_publication(
+            application, spread_id, publish_at, admin_chat_id
+        )
+        restored += 1
+    if restored:
+        logger.info("Restored %s scheduled publication(s)", restored)
+
+
 async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query is None or not query.data or not is_admin(update):
@@ -954,6 +1272,14 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if action == "cancel-spread":
+        scheduled_task = context.application.bot_data.get(
+            "spread_publish_tasks", {}
+        ).pop(spread_id, None)
+        if scheduled_task and not scheduled_task.done():
+            scheduled_task.cancel()
+        await asyncio.to_thread(
+            db.set_setting, _scheduled_spread_key(spread_id), "cancelled"
+        )
         await query.answer("Публикация отменена.")
         try:
             await query.edit_message_reply_markup(reply_markup=None)
@@ -968,6 +1294,15 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
     if spread.get("channel_message_id"):
         await query.answer("Этот расклад уже опубликован.", show_alert=True)
         return
+
+    scheduled_task = context.application.bot_data.get(
+        "spread_publish_tasks", {}
+    ).pop(spread_id, None)
+    if scheduled_task and not scheduled_task.done():
+        scheduled_task.cancel()
+    await asyncio.to_thread(
+        db.set_setting, _scheduled_spread_key(spread_id), "cancelled"
+    )
 
     voice_file_id = await asyncio.to_thread(
         db.get_setting, _spread_voice_key(spread_id)
@@ -1127,6 +1462,52 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
+    pending_schedule_id = context.user_data.get(
+        "pending_schedule_spread_id"
+    )
+    if is_admin(update) and pending_schedule_id is not None:
+        try:
+            scheduled_at = parse_moscow_schedule(text)
+        except (ValueError, OverflowError):
+            await update.message.reply_text(
+                "Не понял дату и время. Отправьте, например: "
+                "<code>завтра 08:00</code> или <code>31.07 08:00</code>.",
+                parse_mode="HTML",
+            )
+            return
+        if scheduled_at.timestamp() <= time.time() + 30:
+            await update.message.reply_text(
+                "Укажите время минимум на одну минуту позже текущего."
+            )
+            return
+
+        spread_id = int(pending_schedule_id)
+        payload = {
+            "publish_at": scheduled_at.timestamp(),
+            "admin_chat_id": update.effective_chat.id,
+        }
+        await asyncio.to_thread(
+            db.set_setting,
+            _scheduled_spread_key(spread_id),
+            json.dumps(payload, separators=(",", ":")),
+        )
+        schedule_spread_publication(
+            context.application,
+            spread_id,
+            scheduled_at.timestamp(),
+            update.effective_chat.id,
+        )
+        context.user_data.pop("pending_schedule_spread_id", None)
+        await update.message.reply_text(
+            "✅ <b>Публикация запланирована</b>\n\n"
+            f"Расклад: #{spread_id}\n"
+            f"Дата и время: <b>{scheduled_at:%d.%m.%Y в %H:%M}</b>\n"
+            "Часовой пояс: Москва.\n\n"
+            "Бот самостоятельно опубликует карты и ваше голосовое.",
+            parse_mode="HTML",
+        )
+        return
+
     if not text.isdigit():
         await update.message.reply_text(
             "🔮 Напиши цифру от 1 до 6, чтобы открыть свою карту дня."
@@ -1572,6 +1953,7 @@ async def verify_runtime(application: Application):
     except TelegramError as exc:
         logger.exception("Card access startup check failed", exc_info=exc)
     await restore_scheduled_deletions(application)
+    await restore_scheduled_publications(application)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1607,6 +1989,12 @@ def main():
         CallbackQueryHandler(
             show_complete_preview_callback,
             pattern=r"^show-preview:",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            schedule_spread_callback,
+            pattern=r"^schedule-spread:",
         )
     )
     application.add_handler(
