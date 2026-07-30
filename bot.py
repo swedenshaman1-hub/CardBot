@@ -428,6 +428,12 @@ def spread_preview_keyboard(
             )
         ],
         [
+            InlineKeyboardButton(
+                "👁 Посмотреть готовую публикацию",
+                callback_data=f"show-preview:{spread_id}",
+            )
+        ],
+        [
             InlineKeyboardButton("✅ Опубликовать в канал", callback_data=f"publish-spread:{spread_id}"),
             InlineKeyboardButton("✖️ Отменить", callback_data=f"cancel-spread:{spread_id}"),
         ]
@@ -467,6 +473,39 @@ def spread_visual_preview_keyboard(spread_id: int) -> InlineKeyboardMarkup:
             for position in range(4, 7)
         ],
     ])
+
+
+async def send_complete_spread_preview(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    spread_id: int,
+    voice_file_id: str,
+):
+    """Send the exact photo+caption+voice sequence without touching the channel."""
+    intro = await asyncio.to_thread(
+        db.get_setting, _spread_intro_key(spread_id)
+    )
+    back_url = await asyncio.to_thread(db.get_card_back_url)
+    collage_path = await asyncio.to_thread(build_collage, back_url, spread_id)
+    try:
+        with open(collage_path, "rb") as preview_image:
+            photo_preview = await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=InputFile(preview_image),
+                caption=spread_caption(intro),
+                parse_mode="Markdown",
+                reply_markup=spread_visual_preview_keyboard(spread_id),
+            )
+    finally:
+        os.remove(collage_path)
+
+    await context.bot.send_voice(
+        chat_id=chat_id,
+        voice=voice_file_id,
+        caption="🎙 Личное послание Дмитрия к сегодняшним картам",
+        reply_to_message_id=photo_preview.message_id,
+        reply_markup=recorded_voice_preview_keyboard(spread_id),
+    )
 
 
 def _auto_delete_setting_key(spread_id: int) -> str:
@@ -685,33 +724,11 @@ async def handle_admin_voice(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "Цифры в этом предпросмотре отключены.",
             parse_mode="HTML",
         )
-        spread = await asyncio.to_thread(db.get_spread, pending_spread_id)
-        intro = await asyncio.to_thread(
-            db.get_setting, _spread_intro_key(pending_spread_id)
-        )
-        back_url = await asyncio.to_thread(db.get_card_back_url)
-        collage_path = await asyncio.to_thread(
-            build_collage, back_url, pending_spread_id
-        )
-        try:
-            with open(collage_path, "rb") as preview_image:
-                photo_preview = await context.bot.send_photo(
-                    chat_id=update.effective_chat.id,
-                    photo=InputFile(preview_image),
-                    caption=spread_caption(intro),
-                    parse_mode="Markdown",
-                    reply_markup=spread_visual_preview_keyboard(
-                        pending_spread_id
-                    ),
-                )
-        finally:
-            os.remove(collage_path)
-        await context.bot.send_voice(
-            chat_id=update.effective_chat.id,
-            voice=voice.file_id,
-            caption="🎙 Личное послание Дмитрия к сегодняшним картам",
-            reply_to_message_id=photo_preview.message_id,
-            reply_markup=recorded_voice_preview_keyboard(pending_spread_id),
+        await send_complete_spread_preview(
+            context,
+            update.effective_chat.id,
+            pending_spread_id,
+            voice.file_id,
         )
         return
 
@@ -884,6 +901,50 @@ async def preview_position_callback(
             "Это предпросмотр. В канале эта кнопка откроет выбранную карту.",
             show_alert=False,
         )
+
+
+async def show_complete_preview_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    if query is None or not query.data or not is_admin(update):
+        return
+
+    try:
+        spread_id = int(query.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await query.answer("Не удалось определить расклад.", show_alert=True)
+        return
+
+    spread = await asyncio.to_thread(db.get_spread, spread_id)
+    if spread is None:
+        await query.answer("Расклад не найден.", show_alert=True)
+        return
+    voice_file_id = await asyncio.to_thread(
+        db.get_setting, _spread_voice_key(spread_id)
+    )
+    if not voice_file_id:
+        await query.answer(
+            "Сначала запишите голосовое послание.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer("Собираю полный предпросмотр…")
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=(
+            "👁 <b>Так публикация будет выглядеть в канале.</b>\n"
+            "Сейчас она отправлена только вам и в канал не попала."
+        ),
+        parse_mode="HTML",
+    )
+    await send_complete_spread_preview(
+        context,
+        query.message.chat_id,
+        spread_id,
+        voice_file_id,
+    )
 
 
 async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1552,6 +1613,12 @@ def main():
         CallbackQueryHandler(
             preview_position_callback,
             pattern=r"^preview-position:",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            show_complete_preview_callback,
+            pattern=r"^show-preview:",
         )
     )
     application.add_handler(
