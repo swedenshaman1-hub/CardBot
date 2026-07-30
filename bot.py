@@ -36,6 +36,8 @@ MAX_CARDS_PER_SPREAD = 2
 AUTO_DELETE_SECONDS = 72 * 60 * 60
 AUTO_DELETE_SETTING_PREFIX = "spread_auto_delete:"
 SPREAD_INTRO_SETTING_PREFIX = "spread_intro:"
+SPREAD_VOICE_SETTING_PREFIX = "spread_voice:"
+SPREAD_CHANNEL_VOICE_PREFIX = "spread_channel_voice:"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -219,6 +221,14 @@ def _spread_intro_key(spread_id: int) -> str:
     return f"{SPREAD_INTRO_SETTING_PREFIX}{spread_id:010d}"
 
 
+def _spread_voice_key(spread_id: int) -> str:
+    return f"{SPREAD_VOICE_SETTING_PREFIX}{spread_id:010d}"
+
+
+def _spread_channel_voice_key(spread_id: int) -> str:
+    return f"{SPREAD_CHANNEL_VOICE_PREFIX}{spread_id:010d}"
+
+
 def _generate_spread_intro(cards: list[dict], recent_intros: list[str]) -> str:
     """Create a fresh author-style introduction grounded in the chosen cards."""
     client = genai.Client(
@@ -316,8 +326,21 @@ def spread_pick_keyboard(spread_id: int, card_ids: list[int]) -> InlineKeyboardM
     ])
 
 
-def spread_preview_keyboard(spread_id: int) -> InlineKeyboardMarkup:
+def spread_preview_keyboard(
+    spread_id: int, has_voice: bool = False
+) -> InlineKeyboardMarkup:
+    voice_label = (
+        "✅ Голос записан — перезаписать"
+        if has_voice
+        else "🎙 Записать моё послание"
+    )
     return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                voice_label,
+                callback_data=f"record-spread:{spread_id}",
+            )
+        ],
         [
             InlineKeyboardButton("✅ Опубликовать в канал", callback_data=f"publish-spread:{spread_id}"),
             InlineKeyboardButton("✖️ Отменить", callback_data=f"cancel-spread:{spread_id}"),
@@ -339,6 +362,28 @@ async def delete_published_spread_later(
     delay = max(0, delete_at - time.time())
     if delay:
         await asyncio.sleep(delay)
+
+    channel_voice_id = await asyncio.to_thread(
+        db.get_setting, _spread_channel_voice_key(spread_id)
+    )
+    if channel_voice_id and channel_voice_id != "deleted":
+        try:
+            await application.bot.delete_message(
+                chat_id=CHANNEL_ID,
+                message_id=int(channel_voice_id),
+            )
+        except (TelegramError, ValueError) as exc:
+            logger.warning(
+                "Could not automatically delete author voice for spread %s: %s",
+                spread_id,
+                exc,
+            )
+        finally:
+            await asyncio.to_thread(
+                db.set_setting,
+                _spread_channel_voice_key(spread_id),
+                "deleted",
+            )
 
     try:
         await application.bot.delete_message(chat_id=CHANNEL_ID, message_id=message_id)
@@ -503,6 +548,21 @@ async def handle_admin_voice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not is_admin(update):
         return
 
+    pending_spread_id = context.user_data.get("pending_spread_voice_id")
+    if pending_spread_id is not None:
+        voice = update.message.voice
+        await asyncio.to_thread(
+            db.set_setting,
+            _spread_voice_key(int(pending_spread_id)),
+            voice.file_id,
+        )
+        context.user_data.pop("pending_spread_voice_id", None)
+        await update.message.reply_text(
+            f"✅ Ваше голосовое послание сохранено для расклада #{pending_spread_id}.\n\n"
+            "Теперь можно вернуться к предпросмотру и нажать «Опубликовать в канал»."
+        )
+        return
+
     pending_id = context.user_data.get("pending_card_id")
     pending_url = context.user_data.get("pending_card_image_url")
 
@@ -593,6 +653,43 @@ async def newspread(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Расклад готов. В канал ничего не отправлено.")
 
 
+async def record_spread_voice_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    if query is None or not query.data or not is_admin(update):
+        return
+
+    try:
+        spread_id = int(query.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await query.answer("Не удалось определить расклад.", show_alert=True)
+        return
+
+    spread = await asyncio.to_thread(db.get_spread, spread_id)
+    if spread is None:
+        await query.answer("Расклад не найден.", show_alert=True)
+        return
+
+    intro = await asyncio.to_thread(db.get_setting, _spread_intro_key(spread_id))
+    if not intro:
+        await query.answer("Текст для озвучивания не найден.", show_alert=True)
+        return
+
+    context.user_data["pending_spread_voice_id"] = spread_id
+    await query.answer("Жду ваше голосовое сообщение.")
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=(
+            "🎙 <b>Текст для вашего голосового послания:</b>\n\n"
+            f"{intro}\n\n"
+            "<b>Теперь запишите и отправьте сюда голосовое сообщение.</b>\n"
+            "Можно читать не дословно — главное сохранить этот смысл и говорить от себя."
+        ),
+        parse_mode="HTML",
+    )
+
+
 async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query is None or not query.data or not is_admin(update):
@@ -649,10 +746,56 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
     finally:
         os.remove(collage_path)
 
+    voice_file_id = await asyncio.to_thread(
+        db.get_setting, _spread_voice_key(spread_id)
+    )
+    if voice_file_id:
+        try:
+            voice_message = await context.bot.send_voice(
+                chat_id=CHANNEL_ID,
+                voice=voice_file_id,
+                caption="🎙 Личное послание Дмитрия к сегодняшним картам",
+                reply_to_message_id=message.message_id,
+            )
+            await asyncio.to_thread(
+                db.set_setting,
+                _spread_channel_voice_key(spread_id),
+                str(voice_message.message_id),
+            )
+        except TelegramError as exc:
+            logger.warning(
+                "Spread %s published, but author voice could not be sent: %s",
+                spread_id,
+                exc,
+            )
+
     previous_spreads = await asyncio.to_thread(db.get_published_spreads)
     for previous_spread in previous_spreads:
         if previous_spread["id"] == spread_id:
             continue
+
+        previous_voice_id = await asyncio.to_thread(
+            db.get_setting,
+            _spread_channel_voice_key(previous_spread["id"]),
+        )
+        if previous_voice_id and previous_voice_id != "deleted":
+            try:
+                await context.bot.delete_message(
+                    chat_id=CHANNEL_ID,
+                    message_id=int(previous_voice_id),
+                )
+            except (TelegramError, ValueError) as exc:
+                logger.warning(
+                    "Could not delete previous author voice for spread %s: %s",
+                    previous_spread["id"],
+                    exc,
+                )
+            finally:
+                await asyncio.to_thread(
+                    db.set_setting,
+                    _spread_channel_voice_key(previous_spread["id"]),
+                    "deleted",
+                )
 
         removed = False
         try:
@@ -1183,6 +1326,12 @@ def main():
     application.add_handler(CommandHandler("clearcards", clearcards))
     application.add_handler(CommandHandler("review", review_cards))
     application.add_handler(CallbackQueryHandler(voice_callback, pattern=r"^voice:"))
+    application.add_handler(
+        CallbackQueryHandler(
+            record_spread_voice_callback,
+            pattern=r"^record-spread:",
+        )
+    )
     application.add_handler(
         CallbackQueryHandler(publish_spread_callback, pattern=r"^(publish|cancel)-spread:")
     )
