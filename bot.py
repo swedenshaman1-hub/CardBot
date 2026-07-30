@@ -375,17 +375,10 @@ def _generate_spread_voice_script(
 
 
 def spread_caption(intro: str | None = None) -> str:
-    opening = (
-        intro.strip()
-        if intro
-        else (
-            "Сегодня я выбрал для вас 6 метафорических карт.\n"
-            "Посмотрите на них и почувствуйте, какая карта сейчас откликается именно вам."
-        )
-    )
     return (
         "🔮 *Карты дня*\n\n"
-        f"{opening}\n\n"
+        "Сегодня я выбрал для вас 6 метафорических карт.\n"
+        "Посмотрите на них и почувствуйте, какая карта сейчас откликается именно вам.\n\n"
         "Чтобы получить своё послание дня, подпишитесь на канал и нажмите номер выбранной карты. Telegram откроет бота автоматически.\n"
         "Описание карты придёт вам в личные сообщения от бота.\n\n"
         "В каждой новой публикации вы можете открывать для себя две карты.\n\n"
@@ -780,25 +773,13 @@ async def newspread(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Все ID должны быть числами.")
         return
 
-    cards, missing = await asyncio.to_thread(db.get_cards, card_ids)
+    _, missing = await asyncio.to_thread(db.get_cards, card_ids)
     if missing:
         await update.message.reply_text(f"Не найдены карты с ID: {missing}")
         return
 
     back_url = await asyncio.to_thread(db.get_card_back_url)
     spread_id = await asyncio.to_thread(db.save_spread, card_ids)
-    recent_intros = await asyncio.to_thread(
-        db.get_recent_settings, SPREAD_INTRO_SETTING_PREFIX, 7
-    )
-    try:
-        intro = await asyncio.to_thread(
-            _generate_spread_intro, cards, recent_intros
-        )
-    except Exception as exc:
-        logger.exception("Could not generate spread intro", exc_info=exc)
-        intro = None
-    if intro:
-        await asyncio.to_thread(db.set_setting, _spread_intro_key(spread_id), intro)
     collage_path = await asyncio.to_thread(build_collage, back_url, spread_id)
     mapping = "\n".join(
         f"{position} → карта №{card_id}"
@@ -810,7 +791,7 @@ async def newspread(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=update.effective_chat.id,
             photo=InputFile(f),
             caption=(
-                f"{spread_caption(intro)}\n\n"
+                f"{spread_caption()}\n\n"
                 f"*Порядок карт для проверки:*\n{mapping}\n\n"
                 "Если всё верно, нажми *«Опубликовать в канал»*."
             ),
