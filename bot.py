@@ -35,6 +35,7 @@ BOT_LINK = "https://t.me/shamankarty_bot"
 MAX_CARDS_PER_SPREAD = 2
 AUTO_DELETE_SECONDS = 72 * 60 * 60
 AUTO_DELETE_SETTING_PREFIX = "spread_auto_delete:"
+SPREAD_INTRO_SETTING_PREFIX = "spread_intro:"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -214,11 +215,81 @@ def narrow_card_text(meaning: str, heading: str | None = None) -> str:
     return f"{heading}\n\n{meaning.strip()}" if heading else meaning.strip()
 
 
-def spread_caption() -> str:
+def _spread_intro_key(spread_id: int) -> str:
+    return f"{SPREAD_INTRO_SETTING_PREFIX}{spread_id:010d}"
+
+
+def _generate_spread_intro(cards: list[dict], recent_intros: list[str]) -> str:
+    """Create a fresh author-style introduction grounded in the chosen cards."""
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=genai_types.HttpOptions(timeout=60_000),
+    )
+    card_context = "\n".join(
+        f"- Карта №{card['id']}: {card.get('meaning', '').strip()[:900]}"
+        for card in cards
+    )
+    recent_context = "\n\n---\n\n".join(recent_intros[-7:]) or "Нет предыдущих текстов."
+    prompt = f"""
+Ты — редактор ежедневного проекта Дмитрия «Карты дня».
+
+Напиши ОДНО уникальное авторское вступление к сегодняшнему раскладу.
+Это не трактовка отдельных карт и не предсказание. Дмитрий лично выбрал шесть
+метафорических карт, а читатель затем интуитивно откроет две из них.
+
+Голос Дмитрия:
+- сердечный, тёплый, живой и простой;
+- ощущение личного присутствия, а не безликого бота;
+- возвращение внимания человека к себе, телу, чувствам и честному внутреннему вопросу;
+- опора и ответы находятся внутри человека;
+- никакого осуждения, давления, диагнозов, мистического тумана и обещаний будущего.
+
+Требования:
+- 35–45 слов, 2 коротких абзаца, не более 300 символов;
+- начать каждый раз по-разному;
+- раскрыть единый смысловой нерв шести карт, не называя их номера и содержание;
+- добавить один точный вопрос для самонаблюдения;
+- закончить мягким приглашением выбрать карту;
+- не использовать штампы «Вселенная посылает знак», «неслучайно», «ответ уже рядом»;
+- не повторять лексику, структуру и вопрос из недавних вступлений;
+- выдать только готовый текст без заголовка и пояснений.
+
+Сегодняшние карты:
+{card_context}
+
+Недавние вступления, которые нельзя повторять:
+{recent_context}
+""".strip()
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(
+            temperature=1.0,
+            max_output_tokens=350,
+        ),
+    )
+    intro = (response.text or "").strip().strip('"')
+    intro = intro.replace("*", "").replace("`", "").replace("_", "")
+    if not intro:
+        raise RuntimeError("Gemini returned an empty spread introduction")
+    if len(intro) > 300:
+        shortened = intro[:297].rsplit(" ", 1)[0].rstrip(" ,;:-")
+        intro = f"{shortened}…"
+    return intro
+
+
+def spread_caption(intro: str | None = None) -> str:
+    opening = (
+        intro.strip()
+        if intro
+        else (
+            "Сегодня я выбрал для вас 6 метафорических карт.\n"
+            "Посмотрите на них и почувствуйте, какая карта сейчас откликается именно вам."
+        )
+    )
     return (
         "🔮 *Карты дня*\n\n"
-        "Сегодня я выбрал для вас 6 метафорических карт.\n"
-        "Посмотрите на них и почувствуйте, какая карта сейчас откликается именно вам.\n\n"
+        f"{opening}\n\n"
         "Чтобы получить своё послание дня, подпишитесь на канал и нажмите номер выбранной карты. Telegram откроет бота автоматически.\n"
         "Описание карты придёт вам в личные сообщения от бота.\n\n"
         "В каждой новой публикации вы можете открывать для себя две карты.\n\n"
@@ -480,13 +551,25 @@ async def newspread(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Все ID должны быть числами.")
         return
 
-    _, missing = await asyncio.to_thread(db.get_cards, card_ids)
+    cards, missing = await asyncio.to_thread(db.get_cards, card_ids)
     if missing:
         await update.message.reply_text(f"Не найдены карты с ID: {missing}")
         return
 
     back_url = await asyncio.to_thread(db.get_card_back_url)
     spread_id = await asyncio.to_thread(db.save_spread, card_ids)
+    recent_intros = await asyncio.to_thread(
+        db.get_recent_settings, SPREAD_INTRO_SETTING_PREFIX, 7
+    )
+    try:
+        intro = await asyncio.to_thread(
+            _generate_spread_intro, cards, recent_intros
+        )
+    except Exception as exc:
+        logger.exception("Could not generate spread intro", exc_info=exc)
+        intro = None
+    if intro:
+        await asyncio.to_thread(db.set_setting, _spread_intro_key(spread_id), intro)
     collage_path = await asyncio.to_thread(build_collage, back_url, spread_id)
     mapping = "\n".join(
         f"{position} → карта №{card_id}"
@@ -498,7 +581,7 @@ async def newspread(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=update.effective_chat.id,
             photo=InputFile(f),
             caption=(
-                f"{spread_caption()}\n\n"
+                f"{spread_caption(intro)}\n\n"
                 f"*Порядок карт для проверки:*\n{mapping}\n\n"
                 "Если всё верно, нажми *«Опубликовать в канал»*."
             ),
@@ -544,13 +627,14 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     back_url = await asyncio.to_thread(db.get_card_back_url)
+    intro = await asyncio.to_thread(db.get_setting, _spread_intro_key(spread_id))
     collage_path = await asyncio.to_thread(build_collage, back_url, spread_id)
     try:
         with open(collage_path, "rb") as f:
             message = await context.bot.send_photo(
                 chat_id=CHANNEL_ID,
                 photo=InputFile(f),
-                caption=spread_caption(),
+                caption=spread_caption(intro),
                 parse_mode="Markdown",
                 reply_markup=spread_pick_keyboard(spread_id, spread["card_ids"]),
             )

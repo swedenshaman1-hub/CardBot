@@ -165,6 +165,20 @@ def get_settings_by_prefix(prefix: str) -> dict[str, str]:
     return {row["key"]: row["value"] for row in res.data or []}
 
 
+def get_recent_settings(prefix: str, limit: int = 7) -> list[str]:
+    """Return the newest saved values for a settings namespace."""
+    client = get_client()
+    res = (
+        client.table("settings")
+        .select("key,value")
+        .like("key", f"{prefix}%")
+        .order("key", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return [row["value"] for row in res.data or []]
+
+
 def _spread_selection_key(spread_id: int, user_id: int) -> str:
     return f"spread_selection:{spread_id}:{user_id}"
 
