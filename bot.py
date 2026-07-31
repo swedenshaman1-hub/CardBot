@@ -16,7 +16,14 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+    Update,
+)
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
@@ -416,13 +423,13 @@ def _generate_spread_voice_script(
 
 
 def _generate_reflection_question(card: dict) -> str:
-    """Create one admin-test question grounded in the original card meaning."""
+    """Create one question grounded in the original card meaning."""
     client = genai.Client(
         api_key=GEMINI_API_KEY,
         http_options=genai_types.HttpOptions(timeout=60_000),
     )
     prompt = f"""
-Ты создаёшь один вопрос для закрытого теста Telegram-бота Дмитрия.
+Ты создаёшь один вопрос для пользователя Telegram-бота Дмитрия.
 
 Оригинальный смысл карты №{card["id"]}:
 {card.get("meaning", "").strip()[:1800]}
@@ -462,13 +469,13 @@ def _generate_reflection_question(card: dict) -> str:
 def _generate_safe_reflection(
     card: dict, question: str, user_answer: str
 ) -> str:
-    """Create one bounded reflection for the admin-only dialogue test."""
+    """Create one bounded reflection for a card dialogue."""
     client = genai.Client(
         api_key=GEMINI_API_KEY,
         http_options=genai_types.HttpOptions(timeout=60_000),
     )
     prompt = f"""
-Ты — цифровой помощник Дмитрия в закрытом тесте. Подготовь один бережный
+Ты — цифровой помощник Дмитрия. Подготовь один бережный
 разбор ответа человека, опираясь только на три источника ниже.
 
 1. Оригинальный смысл карты №{card["id"]}:
@@ -865,6 +872,8 @@ async def _save_card_image(update: Update, context: ContextTypes.DEFAULT_TYPE, f
         await asyncio.to_thread(db.add_card, card_id, f"Карта {card_id}", meaning, image_url)
         await update.message.reply_text(f"✅ Карта #{card_id} сохранена.")
     else:
+        context.user_data.pop("pending_card_reflection", None)
+        context.user_data.pop("pending_reflection_test", None)
         context.user_data["pending_card_id"] = card_id
         context.user_data["pending_card_image_url"] = image_url
         await update.message.reply_text(
@@ -903,6 +912,23 @@ async def addcard_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_admin_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin dictates card description as voice message."""
+    pending_reflection = context.user_data.get("pending_card_reflection")
+    if pending_reflection is not None:
+        status = await update.message.reply_text("🎙️ Слушаю ваш ответ…")
+        try:
+            voice = update.message.voice
+            file = await voice.get_file()
+            ogg_bytes = bytes(await file.download_as_bytearray())
+            answer = await asyncio.to_thread(_transcribe_voice, ogg_bytes)
+            await status.edit_text(f"Ваш ответ: «{answer}»\n\nГотовлю разбор…")
+            await complete_card_reflection(update, context, answer)
+        except Exception as exc:
+            logger.exception("Voice reflection failed", exc_info=exc)
+            await status.edit_text(
+                "Не удалось обработать голосовой ответ. Попробуйте ещё раз или напишите текстом."
+            )
+        return
+
     if not is_admin(update):
         return
 
@@ -1062,6 +1088,8 @@ async def record_spread_voice_callback(
             script,
         )
 
+    context.user_data.pop("pending_card_reflection", None)
+    context.user_data.pop("pending_reflection_test", None)
     context.user_data["pending_spread_voice_id"] = spread_id
     script_parts = script.split("\n", 1)
     hook = escape(script_parts[0].strip())
@@ -1399,6 +1427,8 @@ async def schedule_spread_callback(
         )
         return
 
+    context.user_data.pop("pending_card_reflection", None)
+    context.user_data.pop("pending_reflection_test", None)
     context.user_data["pending_schedule_spread_id"] = spread_id
     await query.answer("Жду дату и время.")
     await context.bot.send_message(
@@ -1651,6 +1681,17 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
+    pending_card_reflection = context.user_data.get("pending_card_reflection")
+    if pending_card_reflection is not None:
+        if len(text) < 3:
+            await update.message.reply_text(
+                "Напишите ответ чуть подробнее — хотя бы одним предложением."
+            )
+            return
+        await update.message.reply_text("Готовлю короткий разбор…")
+        await complete_card_reflection(update, context, text)
+        return
+
     pending_reflection = context.user_data.get("pending_reflection_test")
     if is_admin(update) and pending_reflection is not None:
         if len(text) < 3:
@@ -2012,10 +2053,78 @@ async def card_reaction_callback(
             logger.warning("Card reaction was not recorded: %s", exc)
 
     await query.answer("Отклик сохранён.")
+    if reaction == "reflect":
+        try:
+            for pending_key in (
+                "pending_reflection_test",
+                "pending_schedule_spread_id",
+                "pending_spread_voice_id",
+                "pending_card_id",
+                "pending_card_image_url",
+            ):
+                context.user_data.pop(pending_key, None)
+            await query.edit_message_text("🌿 Подбираю вопрос для осмысления…")
+            card = await asyncio.to_thread(db.get_card, card_id)
+            if card is None:
+                raise RuntimeError("Card not found")
+            question = await asyncio.to_thread(_generate_reflection_question, card)
+            await query.edit_message_text(
+                "🌿 <b>Вопрос для осмысления</b>\n\n"
+                f"{escape(question)}\n\n"
+                "Ответьте одним сообщением — текстом или голосом. "
+                "Я помогу связать ваш ответ со смыслом карты.",
+                parse_mode="HTML",
+            )
+            context.user_data["pending_card_reflection"] = {
+                "card_id": card_id,
+                "question": question,
+            }
+        except Exception as exc:
+            context.user_data.pop("pending_card_reflection", None)
+            logger.exception("Reflection question failed", exc_info=exc)
+            await query.edit_message_text(
+                "Не удалось подготовить вопрос. Попробуйте нажать кнопку ещё раз чуть позже."
+            )
+        return
+
     try:
         await query.edit_message_text(responses[reaction])
     except TelegramError:
         await context.bot.send_message(query.from_user.id, responses[reaction])
+
+
+async def complete_card_reflection(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, answer: str
+):
+    """Return a bounded reflection grounded in the card and user's own words."""
+    pending = context.user_data.get("pending_card_reflection")
+    if pending is None:
+        return
+    try:
+        card = await asyncio.to_thread(db.get_card, int(pending["card_id"]))
+        if card is None:
+            raise RuntimeError("Card not found")
+        reflection = await asyncio.to_thread(
+            _generate_safe_reflection,
+            card,
+            pending["question"],
+            answer,
+        )
+    except Exception as exc:
+        logger.exception("Card reflection failed", exc_info=exc)
+        await update.message.reply_text(
+            "Не удалось подготовить разбор. Попробуйте отправить ответ ещё раз чуть позже."
+        )
+        return
+
+    context.user_data.pop("pending_card_reflection", None)
+    await update.message.reply_text(
+        "🧭 <b>Ваш разбор</b>\n\n"
+        f"{escape(reflection)}\n\n"
+        "<i>Это бережное отражение по смыслу карты и вашим словам, "
+        "а не диагностика или личная консультация.</i>",
+        parse_mode="HTML",
+    )
 
 
 def review_keyboard(card_id: int) -> InlineKeyboardMarkup:
@@ -2252,6 +2361,68 @@ async def clearcards(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Все карты удалены. База чистая.")
 
 
+def analytics_dashboard_keyboard(active_days: int = 7) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("Сегодня", callback_data="admin-stats:1"),
+            InlineKeyboardButton("7 дней", callback_data="admin-stats:7"),
+            InlineKeyboardButton("30 дней", callback_data="admin-stats:30"),
+        ]]
+    )
+
+
+async def build_dashboard_text(bot, days: int) -> str:
+    data = await asyncio.to_thread(db.get_stats, days)
+    counts = data.get("event_counts", {})
+    reactions = data.get("reaction_counts", {})
+    try:
+        subscribers = await bot.get_chat_member_count(CHANNEL_ID)
+        subscriber_text = str(subscribers)
+    except TelegramError:
+        subscriber_text = "недоступно"
+    return (
+        f"📊 <b>Панель «Карта дня» — {days} дн.</b>\n\n"
+        f"👥 Подписчиков канала сейчас: <b>{subscriber_text}</b>\n"
+        f"👤 Получили хотя бы одну карту: <b>{data.get('unique_card_openers', 0)}</b>\n"
+        f"🔢 Нажатий на номера: <b>{counts.get('card_button_clicked', 0)}</b>\n"
+        f"🃏 Успешно открыто карт: <b>{counts.get('card_opened', 0)}</b>\n"
+        f"🎧 Запросов озвучивания: <b>{counts.get('voice_requested', 0)}</b>\n\n"
+        "💬 <b>Отклики</b>\n"
+        f"💫 Мне это близко: <b>{reactions.get('close', 0)}</b>\n"
+        f"🌿 Хочу осмыслить: <b>{reactions.get('reflect', 0)}</b>\n"
+        f"🤍 Сейчас не откликается: <b>{reactions.get('not_now', 0)}</b>\n\n"
+        "<i>Telegram показывает текущее число подписчиков. История точных "
+        "подписок, отписок и просмотров публикаций пока не подключена.</i>"
+    )
+
+
+async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    await update.message.reply_text(
+        await build_dashboard_text(context.bot, 7),
+        parse_mode="HTML",
+        reply_markup=analytics_dashboard_keyboard(7),
+    )
+
+
+async def dashboard_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query is None or not query.data or not is_admin(update):
+        return
+    try:
+        days = int(query.data.split(":", 1)[1])
+    except (IndexError, ValueError):
+        await query.answer("Не удалось открыть статистику.", show_alert=True)
+        return
+    await query.answer("Обновляю статистику…")
+    await query.edit_message_text(
+        await build_dashboard_text(context.bot, days),
+        parse_mode="HTML",
+        reply_markup=analytics_dashboard_keyboard(days),
+    )
+
+
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show anonymous CardBot analytics to the administrator."""
     if not is_admin(update):
@@ -2397,11 +2568,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
+    reply_markup = None
+    if is_admin(update):
+        reply_markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📊 Панель аналитики", callback_data="admin-stats:7")]]
+        )
     await update.message.reply_text(
         "🔮 Добро пожаловать!\n\n"
         "Каждый день в канале появляются 6 карт.\n"
         "Подпишись на канал и выбери две карты из шести — "
-        "получишь их расшифровку и озвучку."
+        "получишь их расшифровку и озвучку.",
+        reply_markup=reply_markup,
     )
 
 
@@ -2410,6 +2587,15 @@ async def verify_runtime(application: Application):
     try:
         me = await application.bot.get_me()
         logger.info("Card bot identity: @%s", me.username)
+        await application.bot.set_my_commands(
+            [
+                BotCommand("dashboard", "Панель аналитики"),
+                BotCommand("stats", "Подробная статистика"),
+                BotCommand("testengagement", "Проверить диалог по карте"),
+                BotCommand("newspread", "Создать новый расклад"),
+            ],
+            scope=BotCommandScopeChat(chat_id=ADMIN_ID),
+        )
         chat = await application.bot.get_chat(CHANNEL_ID)
         logger.info("Card access chat: title=%s type=%s", chat.title, chat.type)
         member = await application.bot.get_chat_member(CHANNEL_ID, me.id)
@@ -2454,12 +2640,15 @@ def main():
     application.add_handler(CommandHandler("editcard", editcard))
     application.add_handler(CommandHandler("clearcards", clearcards))
     application.add_handler(CommandHandler("review", review_cards))
-    application.add_handler(CommandHandler("testdialog", test_reflection_dialog))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("dashboard", dashboard_command))
     application.add_handler(CommandHandler("testengagement", test_engagement_command))
     application.add_handler(CallbackQueryHandler(voice_callback, pattern=r"^voice:"))
     application.add_handler(
         CallbackQueryHandler(card_reaction_callback, pattern=r"^react:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(dashboard_callback, pattern=r"^admin-stats:")
     )
     application.add_handler(
         CallbackQueryHandler(
@@ -2494,7 +2683,9 @@ def main():
     application.add_handler(CallbackQueryHandler(review_callback, pattern=r"^review"))
     application.add_handler(MessageHandler(filters.PHOTO, addcard))
     application.add_handler(MessageHandler(filters.Document.IMAGE, addcard_document))
-    application.add_handler(MessageHandler(filters.VOICE, handle_admin_voice))
+    application.add_handler(
+        MessageHandler(filters.ChatType.PRIVATE & filters.VOICE, handle_admin_voice)
+    )
     application.add_handler(
         MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, handle_private_message)
     )
