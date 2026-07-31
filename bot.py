@@ -22,6 +22,8 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputFile,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
     Update,
 )
 from telegram.error import BadRequest, TelegramError
@@ -1714,6 +1716,47 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
+    if is_admin(update) and text == "🏠 Главное меню":
+        clear_admin_input_states(context)
+        await send_admin_main_menu(context.bot, update.effective_chat.id)
+        return
+
+    if is_admin(update) and context.user_data.get("pending_newspread_menu"):
+        card_numbers = text.split()
+        if len(card_numbers) != 6 or not all(item.isdigit() for item in card_numbers):
+            await update.message.reply_text(
+                "Нужно отправить ровно шесть номеров через пробел. Например: "
+                "<code>3 25 36 48 71 104</code>",
+                parse_mode="HTML",
+            )
+            return
+        context.user_data.pop("pending_newspread_menu", None)
+        context.args = card_numbers
+        await newspread(update, context)
+        return
+
+    if is_admin(update) and context.user_data.get("pending_review_menu"):
+        if not text.isdigit() or not 1 <= int(text) <= 120:
+            await update.message.reply_text("Отправьте номер карты от 1 до 120.")
+            return
+        context.user_data.pop("pending_review_menu", None)
+        await send_review_card(context.bot, update.effective_chat.id, int(text), context)
+        return
+
+    if is_admin(update) and context.user_data.get("pending_test_menu"):
+        if not text.isdigit() or not 1 <= int(text) <= 120:
+            await update.message.reply_text("Отправьте номер карты от 1 до 120.")
+            return
+        context.user_data.pop("pending_test_menu", None)
+        await send_card_to_chat(
+            context.bot,
+            update.effective_chat.id,
+            int(text),
+            spread_id=0,
+            position=1,
+        )
+        return
+
     pending_card_reflection = context.user_data.get("pending_card_reflection")
     if pending_card_reflection is not None:
         if len(text) < 3:
@@ -2541,6 +2584,142 @@ async def test_engagement_command(
     )
 
 
+def admin_persistent_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("🏠 Главное меню")]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def admin_main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📊 Аналитика", callback_data="admin-menu:analytics")],
+            [InlineKeyboardButton("🔮 Создать расклад", callback_data="admin-menu:newspread")],
+            [InlineKeyboardButton("🕗 Запланированные публикации", callback_data="admin-menu:scheduled")],
+            [InlineKeyboardButton("🃏 Проверить карту", callback_data="admin-menu:review")],
+            [InlineKeyboardButton("🧪 Проверить диалог", callback_data="admin-menu:test")],
+            [InlineKeyboardButton("❓ Помощь", callback_data="admin-menu:help")],
+        ]
+    )
+
+
+def clear_admin_input_states(context: ContextTypes.DEFAULT_TYPE):
+    for key in (
+        "pending_newspread_menu",
+        "pending_review_menu",
+        "pending_test_menu",
+        "pending_schedule_spread_id",
+        "pending_spread_voice_id",
+        "pending_card_reflection",
+        "pending_reflection_test",
+    ):
+        context.user_data.pop(key, None)
+
+
+async def send_admin_main_menu(bot, chat_id: int):
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "🏠 <b>Главное меню «Карта дня»</b>\n\n"
+            "Выберите нужный раздел. Все основные действия доступны по кнопкам."
+        ),
+        parse_mode="HTML",
+        reply_markup=admin_main_menu_keyboard(),
+    )
+
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    clear_admin_input_states(context)
+    await update.message.reply_text(
+        "Кнопка «🏠 Главное меню» закреплена под строкой ввода.",
+        reply_markup=admin_persistent_keyboard(),
+    )
+    await send_admin_main_menu(context.bot, update.effective_chat.id)
+
+
+async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query is None or not query.data or not is_admin(update):
+        return
+    section = query.data.split(":", 1)[1]
+    await query.answer()
+
+    if section == "home":
+        clear_admin_input_states(context)
+        await query.edit_message_text(
+            "🏠 <b>Главное меню «Карта дня»</b>\n\nВыберите нужный раздел.",
+            parse_mode="HTML",
+            reply_markup=admin_main_menu_keyboard(),
+        )
+        return
+    if section == "analytics":
+        await query.edit_message_text(
+            await build_dashboard_text(context.bot, 7),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                *analytics_dashboard_keyboard(7).inline_keyboard,
+                [InlineKeyboardButton("⬅️ Главное меню", callback_data="admin-menu:home")],
+            ]),
+        )
+        return
+    if section == "newspread":
+        clear_admin_input_states(context)
+        context.user_data["pending_newspread_menu"] = True
+        text = (
+            "🔮 <b>Создание расклада</b>\n\n"
+            "Отправьте шесть номеров карт через пробел в нужном порядке.\n"
+            "Например: <code>3 25 36 48 71 104</code>"
+        )
+    elif section == "review":
+        clear_admin_input_states(context)
+        context.user_data["pending_review_menu"] = True
+        text = "🃏 <b>Проверка карты</b>\n\nОтправьте номер карты от 1 до 120."
+    elif section == "test":
+        clear_admin_input_states(context)
+        context.user_data["pending_test_menu"] = True
+        text = "🧪 <b>Проверка диалога</b>\n\nОтправьте номер карты от 1 до 120."
+    elif section == "scheduled":
+        records = await asyncio.to_thread(
+            db.get_settings_by_prefix, SCHEDULED_SPREAD_PREFIX
+        )
+        active = []
+        for key, raw_value in records.items():
+            try:
+                payload = json.loads(raw_value)
+                publish_at = datetime.fromtimestamp(
+                    float(payload["publish_at"]), MOSCOW_TZ
+                )
+                if publish_at.timestamp() > time.time():
+                    active.append((publish_at, int(key.removeprefix(SCHEDULED_SPREAD_PREFIX))))
+            except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                continue
+        active.sort()
+        rows = "\n".join(
+            f"• Расклад #{spread_id} — {publish_at:%d.%m.%Y в %H:%M}"
+            for publish_at, spread_id in active
+        ) or "Запланированных публикаций сейчас нет."
+        text = f"🕗 <b>Запланированные публикации</b>\n\n{rows}"
+    else:
+        text = (
+            "❓ <b>Помощь</b>\n\n"
+            "Создайте расклад, проверьте предпросмотр, запишите голосовое и "
+            "выберите публикацию сразу или по расписанию.\n\n"
+            "Если нужно вернуться — нажмите закреплённую кнопку «🏠 Главное меню»."
+        )
+
+    await query.edit_message_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Главное меню", callback_data="admin-menu:home")]]
+        ),
+    )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         token = context.args[0]
@@ -2602,17 +2781,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
-    reply_markup = None
     if is_admin(update):
-        reply_markup = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("📊 Панель аналитики", callback_data="admin-stats:7")]]
+        clear_admin_input_states(context)
+        await update.message.reply_text(
+            "🔮 Панель управления готова. Кнопка «🏠 Главное меню» "
+            "закреплена под строкой ввода.",
+            reply_markup=admin_persistent_keyboard(),
         )
+        await send_admin_main_menu(context.bot, update.effective_chat.id)
+        return
     await update.message.reply_text(
         "🔮 Добро пожаловать!\n\n"
         "Каждый день в канале появляются 6 карт.\n"
         "Подпишись на канал и выбери две карты из шести — "
         "получишь их расшифровку и озвучку.",
-        reply_markup=reply_markup,
     )
 
 
@@ -2623,10 +2805,8 @@ async def verify_runtime(application: Application):
         logger.info("Card bot identity: @%s", me.username)
         await application.bot.set_my_commands(
             [
-                BotCommand("dashboard", "Панель аналитики"),
-                BotCommand("stats", "Подробная статистика"),
-                BotCommand("testengagement", "Проверить диалог по карте"),
-                BotCommand("newspread", "Создать новый расклад"),
+                BotCommand("menu", "Открыть главное меню"),
+                BotCommand("start", "Перезапустить панель управления"),
             ],
             scope=BotCommandScopeChat(chat_id=ADMIN_ID),
         )
@@ -2667,6 +2847,7 @@ def main():
     application = Application.builder().token(BOT_TOKEN).post_init(verify_runtime).build()
 
     application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("menu", menu_command))
     application.add_handler(CommandHandler("newspread", newspread))
     application.add_handler(CommandHandler("addcard", addcard))
     application.add_handler(CommandHandler("listcards", listcards))
@@ -2683,6 +2864,9 @@ def main():
     )
     application.add_handler(
         CallbackQueryHandler(dashboard_callback, pattern=r"^admin-stats:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(admin_menu_callback, pattern=r"^admin-menu:")
     )
     application.add_handler(
         CallbackQueryHandler(
