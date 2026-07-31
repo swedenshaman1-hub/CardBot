@@ -1355,28 +1355,36 @@ def schedule_spread_publication(
 
 
 def parse_moscow_schedule(text: str) -> datetime:
-    """Parse 'завтра 08:00', '31.07 08:00', or '08:00' in Moscow time."""
-    value = " ".join(text.lower().replace(",", " ").split())
+    """Parse common Russian date/time forms in Moscow time."""
+    value = " ".join(text.lower().replace(",", " ").strip().split())
+    value = re.sub(r"\s+в\s+", " ", value)
+    value = re.sub(r"\s*(?:ч|час(?:а|ов)?)\.?$", "", value)
     now = datetime.now(MOSCOW_TZ)
 
-    tomorrow_match = re.fullmatch(
-        r"завтра\s+([01]?\d|2[0-3]):([0-5]\d)", value
+    time_pattern = r"([01]?\d|2[0-3])[:.]([0-5]\d)"
+
+    relative_match = re.fullmatch(
+        rf"(сегодня|завтра)\s+{time_pattern}", value
     )
-    if tomorrow_match:
-        hour, minute = map(int, tomorrow_match.groups())
-        day = (now + timedelta(days=1)).date()
-        return datetime(
-            day.year, day.month, day.day, hour, minute, tzinfo=MOSCOW_TZ
+    if relative_match:
+        relative, hour, minute = relative_match.groups()
+        day = (now + timedelta(days=1 if relative == "завтра" else 0)).date()
+        result = datetime(
+            day.year, day.month, day.day, int(hour), int(minute), tzinfo=MOSCOW_TZ
         )
+        if relative == "сегодня" and result <= now:
+            raise ValueError("Today's time is already past")
+        return result
 
     date_match = re.fullmatch(
-        r"(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?\s+"
-        r"([01]?\d|2[0-3]):([0-5]\d)",
+        rf"(\d{{1,2}})[./-](\d{{1,2}})(?:[./-](\d{{2}}|\d{{4}}))?\s+{time_pattern}",
         value,
     )
     if date_match:
         day, month, year, hour, minute = date_match.groups()
         year_value = int(year) if year else now.year
+        if year and len(year) == 2:
+            year_value += 2000
         result = datetime(
             year_value,
             int(month),
@@ -1389,7 +1397,30 @@ def parse_moscow_schedule(text: str) -> datetime:
             result = result.replace(year=now.year + 1)
         return result
 
-    time_match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", value)
+    month_names = {
+        "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
+        "мая": 5, "июня": 6, "июля": 7, "августа": 8,
+        "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+    }
+    words_match = re.fullmatch(
+        rf"(\d{{1,2}})\s+({'|'.join(month_names)})(?:\s+(\d{{4}}))?\s+{time_pattern}",
+        value,
+    )
+    if words_match:
+        day, month_word, year, hour, minute = words_match.groups()
+        result = datetime(
+            int(year) if year else now.year,
+            month_names[month_word],
+            int(day),
+            int(hour),
+            int(minute),
+            tzinfo=MOSCOW_TZ,
+        )
+        if not year and result <= now:
+            result = result.replace(year=now.year + 1)
+        return result
+
+    time_match = re.fullmatch(time_pattern, value)
     if time_match:
         hour, minute = map(int, time_match.groups())
         result = now.replace(
@@ -1437,6 +1468,8 @@ async def schedule_spread_callback(
             "🕗 <b>Когда опубликовать расклад?</b>\n\n"
             "Отправьте время по Москве в одном из форматов:\n"
             "• <code>завтра 08:00</code>\n"
+            "• <code>1.08 09.00</code>\n"
+            "• <code>1 августа в 09:00</code>\n"
             "• <code>31.07 08:00</code>\n"
             "• <code>08:00</code> — ближайшее такое время\n\n"
             "После этого бот сохранит расписание и покажет подтверждение."
@@ -1737,7 +1770,8 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         except (ValueError, OverflowError):
             await update.message.reply_text(
                 "Не понял дату и время. Отправьте, например: "
-                "<code>завтра 08:00</code> или <code>31.07 08:00</code>.",
+                "<code>завтра 08:00</code>, <code>1.08 09.00</code> "
+                "или <code>1 августа в 09:00</code>.",
                 parse_mode="HTML",
             )
             return
