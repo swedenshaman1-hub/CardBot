@@ -1,11 +1,23 @@
+import hashlib
 import json
 import os
 import time
+from collections import Counter
 from datetime import datetime, timezone
 
 from supabase import create_client
 
 BUCKET = "card-images"
+
+CARD_EVENT_TYPES = {
+    "spread_published",
+    "card_button_clicked",
+    "card_opened",
+    "voice_requested",
+    "voice_sent",
+    "reaction_added",
+    "reaction_removed",
+}
 
 _client = None
 
@@ -177,6 +189,197 @@ def get_recent_settings(prefix: str, limit: int = 7) -> list[str]:
         .execute()
     )
     return [row["value"] for row in res.data or []]
+
+
+# ── privacy-safe analytics ────────────────────────────────────────────────
+
+def record_event(
+    event_type: str,
+    idempotency_key: str,
+    *,
+    spread_id: int | None = None,
+    card_id: int | None = None,
+    card_position: int | None = None,
+    actor_hash: str | None = None,
+    reaction_type: str | None = None,
+) -> bool:
+    """Record one analytics event once; return False for an existing key.
+
+    ``actor_hash`` must already be anonymised by the caller.  This function
+    intentionally has no Telegram user-id argument, so a raw identifier cannot
+    be persisted accidentally.
+    """
+    if event_type not in CARD_EVENT_TYPES:
+        raise ValueError(f"Unsupported CardBot event type: {event_type}")
+    idempotency_key = (idempotency_key or "").strip()
+    if not idempotency_key:
+        raise ValueError("idempotency_key must not be empty")
+    if card_position is not None and not 1 <= int(card_position) <= 6:
+        raise ValueError("card_position must be between 1 and 6")
+
+    row = {
+        "event_type": event_type,
+        "spread_id": spread_id,
+        "card_id": card_id,
+        "card_position": card_position,
+        "actor_hash": actor_hash,
+        "reaction_type": reaction_type,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    event_key = "analytics_event:" + hashlib.sha256(
+        idempotency_key.encode("utf-8")
+    ).hexdigest()
+    if get_setting(event_key) is not None:
+        return False
+    get_client().table("settings").upsert(
+        {"key": event_key, "value": json.dumps(row, ensure_ascii=False)}
+    ).execute()
+    return True
+
+
+def set_card_reaction(
+    spread_id: int,
+    card_id: int,
+    card_position: int,
+    actor_hash: str,
+    reaction_type: str | None,
+    idempotency_key: str,
+) -> bool:
+    """Set one current reaction per spread/card/anonymous actor.
+
+    Passing ``None`` or an empty reaction removes the current reaction.  The
+    return value is True when a reaction remains and False when it was removed.
+    """
+    actor_hash = (actor_hash or "").strip()
+    if not actor_hash:
+        raise ValueError("actor_hash must not be empty")
+    if reaction_type and reaction_type not in {"close", "reflect", "not_now"}:
+        raise ValueError("Unsupported card reaction")
+
+    reaction_key = f"analytics_reaction:{spread_id}:{card_id}:{actor_hash}"
+    if not reaction_type:
+        get_client().table("settings").delete().eq("key", reaction_key).execute()
+        return False
+
+    reaction_row = {
+        "spread_id": spread_id,
+        "card_id": card_id,
+        "actor_hash": actor_hash,
+        "reaction_type": reaction_type,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    get_client().table("settings").upsert(
+        {"key": reaction_key, "value": json.dumps(reaction_row, ensure_ascii=False)}
+    ).execute()
+    record_event(
+        "reaction_added",
+        idempotency_key,
+        spread_id=spread_id,
+        card_id=card_id,
+        card_position=card_position,
+        actor_hash=actor_hash,
+        reaction_type=reaction_type,
+    )
+    return True
+
+
+def _analytics_rows(days: int, spread_id: int | None = None) -> list[dict]:
+    if days < 1:
+        raise ValueError("days must be at least 1")
+    cutoff = datetime.fromtimestamp(time.time() - days * 86400, timezone.utc).isoformat()
+    rows: list[dict] = []
+    page_size = 1000
+    offset = 0
+    while True:
+        page = (
+            get_client()
+            .table("settings")
+            .select("key,value")
+            .like("key", "analytics_event:%")
+            .order("key", desc=True)
+            .range(offset, offset + page_size - 1)
+            .execute()
+            .data
+            or []
+        )
+        for item in page:
+            try:
+                row = json.loads(item["value"])
+                if row.get("created_at", "") < cutoff:
+                    continue
+                if spread_id is not None and row.get("spread_id") != spread_id:
+                    continue
+                rows.append(row)
+            except (KeyError, TypeError, json.JSONDecodeError):
+                continue
+        if len(page) < page_size:
+            return rows
+        offset += page_size
+
+
+def _summarise_events(rows: list[dict]) -> dict:
+    event_counts = Counter(row["event_type"] for row in rows)
+    unique_actors = {
+        row["actor_hash"] for row in rows if row.get("actor_hash")
+    }
+    opened_actors = {
+        row["actor_hash"]
+        for row in rows
+        if row["event_type"] == "card_opened" and row.get("actor_hash")
+    }
+    position_counts = Counter(
+        int(row["card_position"])
+        for row in rows
+        if row["event_type"] == "card_opened" and row.get("card_position") is not None
+    )
+    card_counts = Counter(
+        int(row["card_id"])
+        for row in rows
+        if row["event_type"] == "card_opened" and row.get("card_id") is not None
+    )
+    reaction_counts = Counter(
+        row["reaction_type"]
+        for row in rows
+        if row["event_type"] == "reaction_added" and row.get("reaction_type")
+    )
+    actor_openings: dict[str, set[tuple[int | None, int | None]]] = {}
+    for row in rows:
+        if row["event_type"] != "card_opened" or not row.get("actor_hash"):
+            continue
+        actor_openings.setdefault(row["actor_hash"], set()).add(
+            (row.get("spread_id"), row.get("card_position"))
+        )
+    return {
+        "events_total": len(rows),
+        "event_counts": dict(event_counts),
+        "unique_actors": len(unique_actors),
+        "unique_card_openers": len(opened_actors),
+        "card_opened_by_position": dict(sorted(position_counts.items())),
+        "card_opened_by_card": dict(card_counts.most_common()),
+        "reaction_counts": dict(reaction_counts),
+        "users_opened_one": sum(len(values) == 1 for values in actor_openings.values()),
+        "users_opened_two_or_more": sum(
+            len(values) >= 2 for values in actor_openings.values()
+        ),
+    }
+
+
+def get_stats(days: int = 7) -> dict:
+    """Return aggregate, anonymous CardBot analytics for the last N days."""
+    rows = _analytics_rows(days)
+    result = _summarise_events(rows)
+    result.update({"days": days, "spread_id": None})
+    return result
+
+
+def get_spread_stats(spread_id: int) -> dict:
+    """Return lifetime aggregate analytics for one spread."""
+    # A very wide bounded window keeps the query simple while avoiding an
+    # unfiltered table scan in Supabase/PostgREST.
+    rows = _analytics_rows(36500, spread_id=spread_id)
+    result = _summarise_events(rows)
+    result.update({"days": None, "spread_id": spread_id})
+    return result
 
 
 def _spread_selection_key(spread_id: int, user_id: int) -> str:

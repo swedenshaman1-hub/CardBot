@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -35,6 +37,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 CHANNEL_ID = os.environ["CHANNEL_ID"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+ANALYTICS_SECRET = os.getenv("ANALYTICS_SECRET", BOT_TOKEN)
 BOT_LINK = "https://t.me/shamankarty_bot"
 MAX_CARDS_PER_SPREAD = 2
 AUTO_DELETE_SECONDS = 72 * 60 * 60
@@ -55,6 +58,26 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 def is_admin(update: Update) -> bool:
     return update.effective_user is not None and update.effective_user.id == ADMIN_ID
+
+
+def _actor_hash(user_id: int) -> str:
+    """Return a stable, irreversible analytics identifier."""
+    return hmac.new(
+        ANALYTICS_SECRET.encode("utf-8"),
+        str(user_id).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+async def record_analytics_event(**event):
+    """Queue analytics without delaying card or voice delivery."""
+    async def write_event():
+        try:
+            await asyncio.to_thread(db.record_event, **event)
+        except Exception as exc:
+            logger.warning("Analytics event was not recorded: %s", exc)
+
+    asyncio.create_task(write_event())
 
 
 def _member_has_channel_access(member) -> bool:
@@ -736,7 +759,31 @@ async def restore_scheduled_deletions(application: Application):
         logger.info("Restored %s scheduled spread deletion(s)", restored)
 
 
-async def send_card_to_chat(bot, chat_id: int, card_id: int):
+def card_reaction_keyboard(
+    spread_id: int, card_id: int, position: int
+) -> InlineKeyboardMarkup:
+    prefix = f"react:{spread_id}:{card_id}:{position}"
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💫 Мне это близко", callback_data=f"{prefix}:close")],
+            [InlineKeyboardButton("🌿 Хочу осмыслить", callback_data=f"{prefix}:reflect")],
+            [
+                InlineKeyboardButton(
+                    "🤍 Сейчас не откликается",
+                    callback_data=f"{prefix}:not_now",
+                )
+            ],
+        ]
+    )
+
+
+async def send_card_to_chat(
+    bot,
+    chat_id: int,
+    card_id: int,
+    spread_id: int | None = None,
+    position: int | None = None,
+):
     """Send the original card image and text with an optional voice button."""
     card = await asyncio.to_thread(db.get_card, card_id)
     if card is None:
@@ -748,9 +795,24 @@ async def send_card_to_chat(bot, chat_id: int, card_id: int):
         chat_id=chat_id,
         text=narrow_card_text(card["meaning"]),
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🎧 Прослушать послание", callback_data=f"voice:{card_id}")]]
+            [[
+                InlineKeyboardButton(
+                    "🎧 Прослушать послание",
+                    callback_data=(
+                        f"voice:{spread_id}:{card_id}:{position}"
+                        if spread_id is not None and position is not None
+                        else f"voice:{card_id}"
+                    ),
+                )
+            ]]
         ),
     )
+    if spread_id is not None and position is not None:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="Как вам откликнулось это послание?",
+            reply_markup=card_reaction_keyboard(spread_id, card_id, position),
+        )
 
 
 async def send_card_voice(bot, chat_id: int, card_id: int):
@@ -1186,6 +1248,11 @@ async def publish_scheduled_spread(
     await asyncio.to_thread(
         db.update_spread_message, spread_id, message.message_id
     )
+    await record_analytics_event(
+        event_type="spread_published",
+        idempotency_key=f"spread:{spread_id}:published",
+        spread_id=spread_id,
+    )
     delete_at = time.time() + AUTO_DELETE_SECONDS
     await asyncio.to_thread(
         db.set_setting,
@@ -1556,6 +1623,11 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
             old_task.cancel()
 
     await asyncio.to_thread(db.update_spread_message, spread_id, message.message_id)
+    await record_analytics_event(
+        event_type="spread_published",
+        idempotency_key=f"spread:{spread_id}:published",
+        spread_id=spread_id,
+    )
     delete_at = time.time() + AUTO_DELETE_SECONDS
     await asyncio.to_thread(
         db.set_setting,
@@ -1707,7 +1779,21 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("Карта не найдена.")
         return
 
-    await send_card_to_chat(context.bot, update.effective_chat.id, card_id)
+    await send_card_to_chat(
+        context.bot,
+        update.effective_chat.id,
+        card_id,
+        spread["id"],
+        position,
+    )
+    await record_analytics_event(
+        event_type="card_opened",
+        idempotency_key=f"telegram:update:{update.update_id}:card_opened",
+        spread_id=spread["id"],
+        card_id=card_id,
+        card_position=position,
+        actor_hash=_actor_hash(update.effective_user.id),
+    )
 
 
 async def select_card_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1755,6 +1841,16 @@ async def select_card_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("Этот расклад не найден.", show_alert=True)
         return
 
+    card_id = spread["card_ids"][position - 1]
+    await record_analytics_event(
+        event_type="card_button_clicked",
+        idempotency_key=f"telegram:update:{update.update_id}:card_button_clicked",
+        spread_id=spread["id"],
+        card_id=card_id,
+        card_position=position,
+        actor_hash=_actor_hash(query.from_user.id),
+    )
+
     allowed, message = await require_channel_subscription(context.bot, query.from_user.id)
     if not allowed:
         await query.answer(message, show_alert=True)
@@ -1791,11 +1887,24 @@ async def select_card_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    card_id = spread["card_ids"][position - 1]
     selected_count = len(claim["selections"])
     await query.answer(f"Открываю карту {selected_count} из {MAX_CARDS_PER_SPREAD}…")
     try:
-        await send_card_to_chat(context.bot, query.from_user.id, card_id)
+        await send_card_to_chat(
+            context.bot,
+            query.from_user.id,
+            card_id,
+            spread["id"],
+            position,
+        )
+        await record_analytics_event(
+            event_type="card_opened",
+            idempotency_key=f"telegram:update:{update.update_id}:card_opened",
+            spread_id=spread["id"],
+            card_id=card_id,
+            card_position=position,
+            actor_hash=_actor_hash(query.from_user.id),
+        )
     except Exception as exc:
         logger.exception("Could not send selected card", exc_info=exc)
 
@@ -1806,8 +1915,16 @@ async def voice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query is None or not query.data:
         return
 
+    parts = query.data.split(":")
     try:
-        card_id = int(query.data.split(":", 1)[1])
+        if len(parts) == 4:
+            spread_id = int(parts[1])
+            card_id = int(parts[2])
+            position = int(parts[3])
+        else:
+            spread_id = None
+            card_id = int(parts[1])
+            position = None
     except (IndexError, ValueError):
         await query.answer("Не удалось открыть послание.", show_alert=True)
         return
@@ -1817,14 +1934,88 @@ async def voice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(message, show_alert=True)
         return
 
+
+    if spread_id != 0:
+        await record_analytics_event(
+            event_type="voice_requested",
+            idempotency_key=f"telegram:update:{update.update_id}:voice_requested",
+            spread_id=spread_id,
+            card_id=card_id,
+            card_position=position,
+            actor_hash=_actor_hash(query.from_user.id),
+        )
+
     await query.answer("Озвучиваю послание...")
     try:
         await send_card_voice(context.bot, query.from_user.id, card_id)
+        if spread_id != 0:
+            await record_analytics_event(
+                event_type="voice_sent",
+                idempotency_key=f"telegram:update:{update.update_id}:voice_sent",
+                spread_id=spread_id,
+                card_id=card_id,
+                card_position=position,
+                actor_hash=_actor_hash(query.from_user.id),
+            )
     except Exception:
         await context.bot.send_message(
             chat_id=query.from_user.id,
             text="Не удалось озвучить послание. Попробуй нажать кнопку ещё раз чуть позже.",
         )
+
+
+async def card_reaction_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    try:
+        _, spread_text, card_text, position_text, reaction = query.data.split(":")
+        spread_id = int(spread_text)
+        card_id = int(card_text)
+        position = int(position_text)
+    except (ValueError, IndexError):
+        await query.answer("Не удалось сохранить отклик.", show_alert=True)
+        return
+
+    responses = {
+        "close": (
+            "Спасибо за отклик. Возьмите из послания только то, что помогает "
+            "вам лучше услышать себя."
+        ),
+        "reflect": (
+            "Необязательно понимать всё сразу. Можно оставить послание как "
+            "повод для наблюдения и вернуться к нему позже."
+        ),
+        "not_now": (
+            "Это нормально. Карта не обязана описывать вас или вашу ситуацию. "
+            "Вы можете просто оставить это послание без дальнейших выводов."
+        ),
+    }
+    if reaction not in responses:
+        await query.answer("Не удалось сохранить отклик.", show_alert=True)
+        return
+
+    if spread_id != 0:
+        try:
+            await asyncio.to_thread(
+                db.set_card_reaction,
+                spread_id=spread_id,
+                card_id=card_id,
+                card_position=position,
+                actor_hash=_actor_hash(query.from_user.id),
+                reaction_type=reaction,
+                idempotency_key=f"telegram:update:{update.update_id}:reaction",
+            )
+        except Exception as exc:
+            logger.warning("Card reaction was not recorded: %s", exc)
+
+    await query.answer("Отклик сохранён.")
+    try:
+        await query.edit_message_text(responses[reaction])
+    except TelegramError:
+        await context.bot.send_message(query.from_user.id, responses[reaction])
 
 
 def review_keyboard(card_id: int) -> InlineKeyboardMarkup:
@@ -2061,6 +2252,90 @@ async def clearcards(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Все карты удалены. База чистая.")
 
 
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show anonymous CardBot analytics to the administrator."""
+    if not is_admin(update):
+        return
+    try:
+        if context.args and context.args[0].lower() == "spread":
+            if len(context.args) < 2 or not context.args[1].isdigit():
+                await update.message.reply_text(
+                    "Использование: <code>/stats spread 30</code>",
+                    parse_mode="HTML",
+                )
+                return
+            spread_id = int(context.args[1])
+            data = await asyncio.to_thread(db.get_spread_stats, spread_id)
+            title = f"Статистика расклада №{spread_id}"
+        else:
+            days = 7
+            if context.args:
+                if not context.args[0].isdigit():
+                    await update.message.reply_text(
+                        "Использование: <code>/stats</code>, "
+                        "<code>/stats 30</code> или "
+                        "<code>/stats spread 30</code>",
+                        parse_mode="HTML",
+                    )
+                    return
+                days = min(max(int(context.args[0]), 1), 365)
+            data = await asyncio.to_thread(db.get_stats, days)
+            title = f"Статистика за {days} дн."
+    except Exception as exc:
+        logger.exception("Could not build analytics report", exc_info=exc)
+        await update.message.reply_text(
+            "Статистика пока недоступна. Проверьте таблицы аналитики в Supabase."
+        )
+        return
+
+    counts = data.get("event_counts", {})
+    reactions = data.get("reaction_counts", {})
+    positions = data.get("card_opened_by_position", {})
+    position_lines = "\n".join(
+        f"• {position} — {positions.get(position, positions.get(str(position), 0))}"
+        for position in range(1, 7)
+    )
+    await update.message.reply_text(
+        f"📊 <b>{escape(title)}</b>\n\n"
+        f"Уникальных получателей: <b>{data.get('unique_card_openers', 0)}</b>\n"
+        f"Нажатий на карты: <b>{counts.get('card_button_clicked', 0)}</b>\n"
+        f"Успешно открыто: <b>{counts.get('card_opened', 0)}</b>\n"
+        f"Открыли одну карту: <b>{data.get('users_opened_one', 0)}</b>\n"
+        f"Открыли две: <b>{data.get('users_opened_two_or_more', 0)}</b>\n\n"
+        "🎧 <b>Голос</b>\n"
+        f"Запросили: <b>{counts.get('voice_requested', 0)}</b>\n"
+        f"Получили: <b>{counts.get('voice_sent', 0)}</b>\n\n"
+        "💬 <b>Отклик</b>\n"
+        f"Мне это близко: <b>{reactions.get('close', 0)}</b>\n"
+        f"Хочу осмыслить: <b>{reactions.get('reflect', 0)}</b>\n"
+        f"Сейчас не откликается: <b>{reactions.get('not_now', 0)}</b>\n\n"
+        f"🔢 <b>Открытия по позициям</b>\n{position_lines}",
+        parse_mode="HTML",
+    )
+
+
+async def test_engagement_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """Show the complete private card interaction without publishing a spread."""
+    if not is_admin(update):
+        return
+    card_id = 1
+    if context.args:
+        try:
+            card_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("Использование: <code>/testengagement 9</code>", parse_mode="HTML")
+            return
+    await send_card_to_chat(
+        context.bot,
+        update.effective_chat.id,
+        card_id,
+        spread_id=0,
+        position=1,
+    )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         token = context.args[0]
@@ -2105,7 +2380,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
 
                 card_id = spread["card_ids"][position - 1]
-                await send_card_to_chat(context.bot, update.effective_chat.id, card_id)
+                await send_card_to_chat(
+                    context.bot,
+                    update.effective_chat.id,
+                    card_id,
+                    spread_id,
+                    position,
+                )
+                await record_analytics_event(
+                    event_type="card_opened",
+                    idempotency_key=f"telegram:update:{update.update_id}:card_opened",
+                    spread_id=spread_id,
+                    card_id=card_id,
+                    card_position=position,
+                    actor_hash=_actor_hash(update.effective_user.id),
+                )
                 return
 
     await update.message.reply_text(
@@ -2166,7 +2455,12 @@ def main():
     application.add_handler(CommandHandler("clearcards", clearcards))
     application.add_handler(CommandHandler("review", review_cards))
     application.add_handler(CommandHandler("testdialog", test_reflection_dialog))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("testengagement", test_engagement_command))
     application.add_handler(CallbackQueryHandler(voice_callback, pattern=r"^voice:"))
+    application.add_handler(
+        CallbackQueryHandler(card_reaction_callback, pattern=r"^react:")
+    )
     application.add_handler(
         CallbackQueryHandler(
             record_spread_voice_callback,
