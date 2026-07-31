@@ -513,13 +513,19 @@ def _generate_safe_reflection(
 - не обещай результат и не используй мистические объяснения.
 
 Формат:
-- 100–150 слов;
+- 80–120 слов;
 - 3 коротких абзаца;
 - сначала точно отрази то, что человек действительно написал;
 - затем покажи одну возможную связь с темой карты, обязательно как гипотезу;
 - закончи одним небольшим наблюдением или безопасным действием на сегодня;
 - не задавай второго вопроса;
 - не используй Markdown, заголовок и служебные пояснения.
+
+Особенно важно:
+- не разворачивай одно слово человека в психологическую теорию;
+- не добавляй качества, мотивы и переживания, которых нет в ответе;
+- не пересказывай очевидное вроде «в твоём ответе звучит слово...»;
+- если данных недостаточно, честно скажи об этом вместо догадки.
 
 Если ответ содержит намерение причинить вред себе/другим, признаки острого
 кризиса или просьбу о диагнозе — вместо разбора напиши, что бот не может
@@ -539,6 +545,22 @@ def _generate_safe_reflection(
     if not reflection:
         raise RuntimeError("Gemini returned an empty reflection")
     return reflection
+
+
+def reflection_answer_is_detailed(answer: str) -> bool:
+    words = re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", answer)
+    return len(words) >= 5 and len(answer.strip()) >= 20
+
+
+def reflection_clarification(answer: str) -> str:
+    short_answer = " ".join(answer.strip().strip(".?!,;:\"«»").split())[:120]
+    return (
+        f"«{short_answer}» — важный ответ, но пока он слишком короткий для "
+        "точного разбора.\n\n"
+        "Раскройте немного подробнее: что это означает лично для вас в "
+        "контексте вопроса и где вы замечаете это в своей жизни сейчас?\n\n"
+        "Ответьте одним-двумя предложениями — текстом или голосом."
+    )
 
 
 def spread_caption(intro: str | None = None) -> str:
@@ -922,6 +944,9 @@ async def handle_admin_voice(update: Update, context: ContextTypes.DEFAULT_TYPE)
             file = await voice.get_file()
             ogg_bytes = bytes(await file.download_as_bytearray())
             answer = await asyncio.to_thread(_transcribe_voice, ogg_bytes)
+            if not reflection_answer_is_detailed(answer):
+                await status.edit_text(reflection_clarification(answer))
+                return
             await status.edit_text(f"Ваш ответ: «{answer}»\n\nГотовлю разбор…")
             await complete_card_reflection(update, context, answer)
         except Exception as exc:
@@ -1759,10 +1784,8 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
 
     pending_card_reflection = context.user_data.get("pending_card_reflection")
     if pending_card_reflection is not None:
-        if len(text) < 3:
-            await update.message.reply_text(
-                "Напишите ответ чуть подробнее — хотя бы одним предложением."
-            )
+        if not reflection_answer_is_detailed(text):
+            await update.message.reply_text(reflection_clarification(text))
             return
         await update.message.reply_text("Готовлю короткий разбор…")
         await complete_card_reflection(update, context, text)
