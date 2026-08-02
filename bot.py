@@ -49,6 +49,7 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 ANALYTICS_SECRET = os.getenv("ANALYTICS_SECRET", BOT_TOKEN)
 BOT_LINK = "https://t.me/shamankarty_bot"
 MAX_CARDS_PER_SPREAD = 2
+REFLECTION_PROMPT_VERSION = "v2"
 AUTO_DELETE_SECONDS = 72 * 60 * 60
 AUTO_DELETE_SETTING_PREFIX = "spread_auto_delete:"
 SPREAD_INTRO_SETTING_PREFIX = "spread_intro:"
@@ -2181,6 +2182,18 @@ async def card_reaction_callback(
                 "position": position,
                 "question": question,
             }
+            if spread_id != 0:
+                await record_analytics_event(
+                    event_type="reflection_question_shown",
+                    idempotency_key=(
+                        f"telegram:update:{update.update_id}:reflection_question_shown"
+                    ),
+                    spread_id=spread_id,
+                    card_id=card_id,
+                    card_position=position,
+                    actor_hash=_actor_hash(query.from_user.id),
+                    metadata={"prompt_version": REFLECTION_PROMPT_VERSION},
+                )
         except Exception as exc:
             context.user_data.pop("pending_card_reflection", None)
             logger.exception("Reflection question failed", exc_info=exc)
@@ -2206,6 +2219,19 @@ async def complete_card_reflection(
         card = await asyncio.to_thread(db.get_card, int(pending["card_id"]))
         if card is None:
             raise RuntimeError("Card not found")
+        spread_id = int(pending.get("spread_id", 0))
+        card_id = int(pending["card_id"])
+        position = int(pending.get("position", 1))
+        if spread_id != 0:
+            await record_analytics_event(
+                event_type="reflection_answered",
+                idempotency_key=f"telegram:update:{update.update_id}:reflection_answered",
+                spread_id=spread_id,
+                card_id=card_id,
+                card_position=position,
+                actor_hash=_actor_hash(update.effective_user.id),
+                metadata={"prompt_version": REFLECTION_PROMPT_VERSION},
+            )
         reflection = await asyncio.to_thread(
             _generate_safe_reflection,
             card,
@@ -2219,9 +2245,16 @@ async def complete_card_reflection(
         )
         return
 
-    spread_id = int(pending.get("spread_id", 0))
-    card_id = int(pending["card_id"])
-    position = int(pending.get("position", 1))
+    if spread_id != 0:
+        await record_analytics_event(
+            event_type="reflection_completed",
+            idempotency_key=f"telegram:update:{update.update_id}:reflection_completed",
+            spread_id=spread_id,
+            card_id=card_id,
+            card_position=position,
+            actor_hash=_actor_hash(update.effective_user.id),
+            metadata={"prompt_version": REFLECTION_PROMPT_VERSION},
+        )
     context.user_data.pop("pending_card_reflection", None)
     await update.message.reply_text(
         "🧭 <b>Ваш разбор</b>\n\n"
@@ -2279,6 +2312,7 @@ async def reflection_feedback_callback(
             card_position=position,
             actor_hash=_actor_hash(query.from_user.id),
             reaction_type=feedback,
+            metadata={"prompt_version": REFLECTION_PROMPT_VERSION},
         )
     await query.answer("Спасибо, ваш ответ сохранён.", show_alert=False)
     await query.edit_message_reply_markup(reply_markup=None)
@@ -2528,6 +2562,47 @@ def analytics_dashboard_keyboard(active_days: int = 7) -> InlineKeyboardMarkup:
     )
 
 
+def format_reflection_quality(data: dict) -> str:
+    counts = data.get("event_counts", {})
+    feedback = data.get("reflection_feedback_counts", {})
+    yes = int(feedback.get("yes", 0))
+    partly = int(feedback.get("partly", 0))
+    no = int(feedback.get("no", 0))
+    feedback_total = yes + partly + no
+    quality_score = round((yes + partly * 0.5) / feedback_total * 100) if feedback_total else 0
+    questions = int(counts.get("reflection_question_shown", 0))
+    answered = int(counts.get("reflection_answered", 0))
+    completed = int(counts.get("reflection_completed", 0))
+    answer_rate = round(answered / questions * 100) if questions else 0
+
+    by_card = data.get("reflection_feedback_by_card", {})
+    problem_cards = []
+    for raw_card_id, card_feedback in by_card.items():
+        negative_weight = int(card_feedback.get("no", 0)) * 2 + int(
+            card_feedback.get("partly", 0)
+        )
+        if negative_weight:
+            problem_cards.append((negative_weight, int(raw_card_id), card_feedback))
+    problem_cards.sort(reverse=True)
+    review_line = "нет данных"
+    if problem_cards:
+        review_line = ", ".join(
+            f"№{card_id} (частично {card_feedback.get('partly', 0)}, нет {card_feedback.get('no', 0)})"
+            for _, card_id, card_feedback in problem_cards[:3]
+        )
+
+    return (
+        "🧠 <b>Качество Gemini</b>\n"
+        f"Вопрос показан: <b>{questions}</b>\n"
+        f"Ответили: <b>{answered}</b> ({answer_rate}%)\n"
+        f"Получили разбор: <b>{completed}</b>\n"
+        f"Оценили разбор: <b>{feedback_total}</b>\n"
+        f"Индекс точности: <b>{quality_score}%</b>\n"
+        f"На проверку: <b>{review_line}</b>\n"
+        f"Версия настроек: <b>{REFLECTION_PROMPT_VERSION}</b>"
+    )
+
+
 async def build_dashboard_text(bot, days: int) -> str:
     data = await asyncio.to_thread(db.get_stats, days)
     counts = data.get("event_counts", {})
@@ -2553,6 +2628,7 @@ async def build_dashboard_text(bot, days: int) -> str:
         f"Да, точно: <b>{feedback.get('yes', 0)}</b>\n"
         f"Частично: <b>{feedback.get('partly', 0)}</b>\n"
         f"Нет, не про меня: <b>{feedback.get('no', 0)}</b>\n\n"
+        f"{format_reflection_quality(data)}\n\n"
         "<i>Telegram показывает текущее число подписчиков. История точных "
         "подписок, отписок и просмотров публикаций пока не подключена.</i>"
     )
@@ -2647,6 +2723,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Да, точно: <b>{feedback.get('yes', 0)}</b>\n"
         f"Частично: <b>{feedback.get('partly', 0)}</b>\n"
         f"Нет, не про меня: <b>{feedback.get('no', 0)}</b>\n\n"
+        f"{format_reflection_quality(data)}\n\n"
         f"🔢 <b>Открытия по позициям</b>\n{position_lines}",
         parse_mode="HTML",
     )

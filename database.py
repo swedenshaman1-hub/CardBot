@@ -18,6 +18,9 @@ CARD_EVENT_TYPES = {
     "reaction_added",
     "reaction_removed",
     "reflection_feedback",
+    "reflection_question_shown",
+    "reflection_answered",
+    "reflection_completed",
 }
 
 _client = None
@@ -203,6 +206,7 @@ def record_event(
     card_position: int | None = None,
     actor_hash: str | None = None,
     reaction_type: str | None = None,
+    metadata: dict | None = None,
 ) -> bool:
     """Record one analytics event once; return False for an existing key.
 
@@ -225,6 +229,7 @@ def record_event(
         "card_position": card_position,
         "actor_hash": actor_hash,
         "reaction_type": reaction_type,
+        "metadata": metadata or {},
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     event_key = "analytics_event:" + hashlib.sha256(
@@ -348,6 +353,14 @@ def _summarise_events(rows: list[dict]) -> dict:
         for row in rows
         if row["event_type"] == "reflection_feedback" and row.get("reaction_type")
     )
+    reflection_feedback_by_card: dict[int, Counter] = {}
+    for row in rows:
+        if row["event_type"] != "reflection_feedback" or not row.get("card_id"):
+            continue
+        card_id = int(row["card_id"])
+        reflection_feedback_by_card.setdefault(card_id, Counter())[
+            row.get("reaction_type") or "unknown"
+        ] += 1
     actor_openings: dict[str, set[tuple[int | None, int | None]]] = {}
     for row in rows:
         if row["event_type"] != "card_opened" or not row.get("actor_hash"):
@@ -364,6 +377,10 @@ def _summarise_events(rows: list[dict]) -> dict:
         "card_opened_by_card": dict(card_counts.most_common()),
         "reaction_counts": dict(reaction_counts),
         "reflection_feedback_counts": dict(reflection_feedback_counts),
+        "reflection_feedback_by_card": {
+            card_id: dict(counts)
+            for card_id, counts in reflection_feedback_by_card.items()
+        },
         "users_opened_one": sum(len(values) == 1 for values in actor_openings.values()),
         "users_opened_two_or_more": sum(
             len(values) >= 2 for values in actor_openings.values()
