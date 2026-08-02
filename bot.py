@@ -472,7 +472,9 @@ def _generate_reflection_question(card: dict) -> str:
     return question
 
 
-def _generate_spread_question(cards: list[dict]) -> str:
+def _generate_spread_question(
+    cards: list[dict], topic: str | None = None
+) -> str:
     """Create one open question grounded in all six cards."""
     client = genai.Client(
         api_key=GEMINI_API_KEY,
@@ -483,11 +485,18 @@ def _generate_spread_question(cards: list[dict]) -> str:
         f"{card.get('meaning', '').strip()[:1800]}"
         for card in cards
     )
+    topic_instruction = (
+        f"\nТема, которую выбрал автор: {topic.strip()[:200]}\n"
+        "Сделай эту тему главным смысловым направлением вопроса."
+        if topic and topic.strip()
+        else ""
+    )
     prompt = f"""
 Ты создаёшь один короткий «Вопрос дня» к раскладу из шести метафорических карт.
 
 Карты расклада:
 {cards_context}
+{topic_instruction}
 
 Сформулируй ровно один короткий открытый вопрос от второго лица — обращайся к человеку на «вы».
 Используй от 6 до 10 слов. Вопрос должен легко читаться в Telegram Stories.
@@ -743,7 +752,13 @@ def spread_question_keyboard(
     rows.extend([
         [
             InlineKeyboardButton(
-                "✍️ Написать свой",
+                "🎯 Предложить по моей теме",
+                callback_data=f"question-spread:topic:{spread_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "✍️ Ввести готовый вопрос",
                 callback_data=f"question-spread:custom:{spread_id}",
             )
         ],
@@ -771,6 +786,26 @@ def spread_question_screen_text(question: str | None, notice: str | None = None)
         f"Текущий вопрос:\n{current}\n\n"
         f"Максимальная длина — {SPREAD_QUESTION_MAX_LENGTH} символов."
     )
+
+
+async def generate_spread_question_for_topic(
+    spread_id: int, topic: str
+) -> str:
+    """Generate and immediately persist one question for the author's topic."""
+    topic = " ".join((topic or "").split())
+    if not topic:
+        raise ValueError("Тема не может быть пустой.")
+    spread = await asyncio.to_thread(db.get_spread, spread_id)
+    if spread is None:
+        raise ValueError("Расклад не найден.")
+    cards, missing = await asyncio.to_thread(db.get_cards, spread["card_ids"])
+    if missing:
+        raise ValueError("Часть карт расклада не найдена.")
+    question = await asyncio.to_thread(
+        _generate_spread_question, cards, topic
+    )
+    await asyncio.to_thread(db.update_spread_question, spread_id, question)
+    return question
 
 
 def recorded_voice_preview_keyboard(spread_id: int) -> InlineKeyboardMarkup:
@@ -1107,6 +1142,45 @@ async def handle_admin_voice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not is_admin(update):
         return
 
+    pending_topic_spread_id = context.user_data.get(
+        "pending_spread_question_topic_id"
+    )
+    if (
+        context.user_data.get("pending_spread_question_topic")
+        and pending_topic_spread_id is not None
+    ):
+        status = await update.message.reply_text("🎙️ Расшифровываю тему…")
+        try:
+            voice = update.message.voice
+            file = await voice.get_file()
+            ogg_bytes = bytes(await file.download_as_bytearray())
+            topic = await asyncio.to_thread(_transcribe_voice, ogg_bytes)
+            await status.edit_text(
+                f"Тема: «{topic}»\n\nГотовлю короткий вопрос…"
+            )
+            question = await generate_spread_question_for_topic(
+                int(pending_topic_spread_id), topic
+            )
+        except Exception as exc:
+            logger.exception("Voice spread topic generation failed", exc_info=exc)
+            await status.edit_text(
+                "Не удалось подготовить вопрос. Попробуйте ещё раз голосом "
+                "или напишите тему текстом."
+            )
+            return
+        context.user_data.pop("pending_spread_question_topic", None)
+        context.user_data.pop("pending_spread_question_topic_id", None)
+        await status.edit_text(
+            spread_question_screen_text(
+                question, "✅ Короткий вопрос по вашей теме сохранён."
+            ),
+            parse_mode="HTML",
+            reply_markup=spread_question_keyboard(
+                int(pending_topic_spread_id), allow_generate=False
+            ),
+        )
+        return
+
     pending_spread_id = context.user_data.get("pending_spread_voice_id")
     if pending_spread_id is not None:
         pending_spread_id = int(pending_spread_id)
@@ -1230,12 +1304,31 @@ async def spread_question_callback(
     if action == "show":
         context.user_data.pop("pending_spread_question_input", None)
         context.user_data.pop("pending_spread_question_id", None)
+        context.user_data.pop("pending_spread_question_topic", None)
+        context.user_data.pop("pending_spread_question_topic_id", None)
         await query.answer()
         await context.bot.send_message(
             chat_id=query.message.chat_id,
             text=spread_question_screen_text(spread.get("question")),
             parse_mode="HTML",
             reply_markup=spread_question_keyboard(spread_id),
+        )
+        return
+
+    if action == "topic":
+        clear_admin_input_states(context)
+        context.user_data["pending_spread_question_topic"] = True
+        context.user_data["pending_spread_question_topic_id"] = spread_id
+        await query.answer()
+        await query.edit_message_text(
+            spread_question_screen_text(
+                spread.get("question"),
+                "Напишите или скажите голосом тему. Например: отношения.",
+            ),
+            parse_mode="HTML",
+            reply_markup=spread_question_keyboard(
+                spread_id, allow_generate=False
+            ),
         )
         return
 
@@ -1290,7 +1383,7 @@ async def spread_question_callback(
         await query.edit_message_text(
             spread_question_screen_text(
                 spread.get("question"),
-                "Напишите и отправьте свой вопрос одним сообщением.",
+                "Отправьте готовый вопрос текстом. Бот сохранит его без изменений.",
             ),
             parse_mode="HTML",
             reply_markup=spread_question_keyboard(
@@ -1303,6 +1396,8 @@ async def spread_question_callback(
         await asyncio.to_thread(db.update_spread_question, spread_id, None)
         context.user_data.pop("pending_spread_question_input", None)
         context.user_data.pop("pending_spread_question_id", None)
+        context.user_data.pop("pending_spread_question_topic", None)
+        context.user_data.pop("pending_spread_question_topic_id", None)
         await query.answer("Вопрос убран.")
         await query.edit_message_text(
             spread_question_screen_text(None, "✅ Вопрос удалён из расклада."),
@@ -1937,6 +2032,35 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     if is_admin(update) and text == "🏠 Главное меню":
         clear_admin_input_states(context)
         await send_admin_main_menu(context.bot, update.effective_chat.id)
+        return
+
+    if is_admin(update) and context.user_data.get("pending_spread_question_topic"):
+        spread_id = context.user_data.get("pending_spread_question_topic_id")
+        status = await update.message.reply_text(
+            f"Тема: «{text}»\n\nГотовлю короткий вопрос…"
+        )
+        try:
+            question = await generate_spread_question_for_topic(
+                int(spread_id), text
+            )
+        except Exception as exc:
+            logger.exception("Text spread topic generation failed", exc_info=exc)
+            await status.edit_text(
+                "Не удалось подготовить вопрос. Попробуйте другую формулировку "
+                "темы или отправьте её голосом."
+            )
+            return
+        context.user_data.pop("pending_spread_question_topic", None)
+        context.user_data.pop("pending_spread_question_topic_id", None)
+        await status.edit_text(
+            spread_question_screen_text(
+                question, "✅ Короткий вопрос по вашей теме сохранён."
+            ),
+            parse_mode="HTML",
+            reply_markup=spread_question_keyboard(
+                int(spread_id), allow_generate=False
+            ),
+        )
         return
 
     if is_admin(update) and context.user_data.get("pending_spread_question_input"):
@@ -3002,6 +3126,8 @@ def clear_admin_input_states(context: ContextTypes.DEFAULT_TYPE):
         "pending_reflection_test",
         "pending_spread_question_input",
         "pending_spread_question_id",
+        "pending_spread_question_topic",
+        "pending_spread_question_topic_id",
     ):
         context.user_data.pop(key, None)
 
