@@ -50,6 +50,9 @@ ANALYTICS_SECRET = os.getenv("ANALYTICS_SECRET", BOT_TOKEN)
 BOT_LINK = "https://t.me/shamankarty_bot"
 MAX_CARDS_PER_SPREAD = 2
 REFLECTION_PROMPT_VERSION = "v2"
+SPREAD_QUESTION_PROMPT_VERSION = "v1"
+SPREAD_QUESTION_MAX_LENGTH = 150
+TELEGRAM_CAPTION_MAX_LENGTH = 1024
 AUTO_DELETE_SECONDS = 72 * 60 * 60
 AUTO_DELETE_SETTING_PREFIX = "spread_auto_delete:"
 SPREAD_INTRO_SETTING_PREFIX = "spread_intro:"
@@ -469,6 +472,46 @@ def _generate_reflection_question(card: dict) -> str:
     return question
 
 
+def _generate_spread_question(cards: list[dict]) -> str:
+    """Create one open question grounded in all six cards."""
+    client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=genai_types.HttpOptions(timeout=60_000),
+    )
+    cards_context = "\n\n".join(
+        f"Карта №{card['id']} — {card.get('name', '').strip()}:\n"
+        f"{card.get('meaning', '').strip()[:1800]}"
+        for card in cards
+    )
+    prompt = f"""
+Ты создаёшь один короткий «Вопрос дня» к раскладу из шести метафорических карт.
+
+Карты расклада:
+{cards_context}
+
+Сформулируй ровно один открытый вопрос от второго лица — обращайся к человеку на «вы».
+Вопрос должен объединять общий смысл расклада, приглашать к самостоятельному размышлению,
+не допускать ответа только «да» или «нет» и не обещать результат, исцеление или изменение.
+Не ставь диагнозов, не называй скрытых причин и не используй мистические утверждения.
+
+Верни только вопрос без заголовка, пояснения, Markdown и кавычек.
+Максимальная длина — {SPREAD_QUESTION_MAX_LENGTH} символов.
+""".strip()
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(
+            temperature=0.75,
+            max_output_tokens=250,
+            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+        ),
+    )
+    question = normalize_spread_question((response.text or "").strip().strip('"'))
+    if question.count("?") != 1 or not question.endswith("?"):
+        raise RuntimeError("Gemini did not return exactly one question")
+    return question
+
+
 def _generate_safe_reflection(
     card: dict, question: str, user_answer: str
 ) -> str:
@@ -564,16 +607,56 @@ def reflection_clarification(answer: str) -> str:
     )
 
 
-def spread_caption() -> str:
-    return (
+def normalize_spread_question(question: str) -> str:
+    question = " ".join((question or "").split())
+    if not question:
+        raise ValueError("Вопрос не может быть пустым.")
+    if len(question) > SPREAD_QUESTION_MAX_LENGTH:
+        raise ValueError(
+            f"Вопрос должен быть не длиннее {SPREAD_QUESTION_MAX_LENGTH} символов."
+        )
+    return question
+
+
+def escape_markdown_question(question: str) -> str:
+    """Escape administrator text for Telegram's legacy Markdown mode."""
+    escaped = question.replace("\\", "\\\\")
+    for character in ("_", "*", "[", "]", "`"):
+        escaped = escaped.replace(character, f"\\{character}")
+    return escaped
+
+
+def spread_caption(question: str | None = None) -> str:
+    intro = (
         "🔮 *Карты дня*\n\n"
         "Сегодня я выбрал для вас 6 метафорических карт.\n"
-        "Посмотрите на них и почувствуйте, какая карта сейчас откликается именно вам.\n\n"
+        "Посмотрите на них и почувствуйте, какая карта сейчас откликается именно вам."
+    )
+    remainder = (
         "Чтобы получить своё послание дня, подпишитесь на канал и нажмите номер выбранной карты. Telegram откроет бота автоматически.\n"
         "Описание карты придёт вам в личные сообщения от бота.\n\n"
         "В каждой новой публикации вы можете открывать для себя две карты.\n\n"
         "Если вам откликнулось послание, оставьте реакцию — пусть это будет наш энергообмен."
     )
+    if question is None:
+        caption = f"{intro}\n\n{remainder}"
+    else:
+        safe_question = escape_markdown_question(
+            normalize_spread_question(question)
+        )
+        caption = (
+            f"{intro}\n\n"
+            f"❓ *Вопрос дня*\n{safe_question}\n\n"
+            f"{remainder}"
+        )
+    if len(caption) > TELEGRAM_CAPTION_MAX_LENGTH:
+        logger.error(
+            "Spread caption is too long: %s characters (limit %s)",
+            len(caption),
+            TELEGRAM_CAPTION_MAX_LENGTH,
+        )
+        raise ValueError("Spread caption exceeds Telegram caption limit")
+    return caption
 
 
 def spread_pick_keyboard(spread_id: int, card_ids: list[int]) -> InlineKeyboardMarkup:
@@ -612,6 +695,12 @@ def spread_preview_keyboard(
         ],
         [
             InlineKeyboardButton(
+                "❓ Вопрос дня",
+                callback_data=f"question-spread:show:{spread_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
                 "👁 Посмотреть готовую публикацию",
                 callback_data=f"show-preview:{spread_id}",
             )
@@ -624,6 +713,60 @@ def spread_preview_keyboard(
             InlineKeyboardButton("✖️ Отменить", callback_data=f"cancel-spread:{spread_id}"),
         ]
     ])
+
+
+def spread_question_keyboard(
+    spread_id: int,
+    *,
+    allow_generate: bool = True,
+    allow_regenerate: bool = False,
+) -> InlineKeyboardMarkup:
+    rows = []
+    if allow_generate:
+        rows.append([
+            InlineKeyboardButton(
+                "✨ Предложить через Gemini",
+                callback_data=f"question-spread:generate:{spread_id}",
+            )
+        ])
+    elif allow_regenerate:
+        rows.append([
+            InlineKeyboardButton(
+                "🔄 Ещё вариант",
+                callback_data=f"question-spread:regenerate:{spread_id}",
+            )
+        ])
+    rows.extend([
+        [
+            InlineKeyboardButton(
+                "✍️ Написать свой",
+                callback_data=f"question-spread:custom:{spread_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🗑 Убрать вопрос",
+                callback_data=f"question-spread:remove:{spread_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ Вернуться к раскладу",
+                callback_data=f"question-spread:back:{spread_id}",
+            )
+        ],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def spread_question_screen_text(question: str | None, notice: str | None = None) -> str:
+    current = escape(question) if question else "<i>не задан</i>"
+    prefix = f"{escape(notice)}\n\n" if notice else ""
+    return (
+        f"{prefix}❓ <b>Вопрос дня</b>\n\n"
+        f"Текущий вопрос:\n{current}\n\n"
+        f"Максимальная длина — {SPREAD_QUESTION_MAX_LENGTH} символов."
+    )
 
 
 def recorded_voice_preview_keyboard(spread_id: int) -> InlineKeyboardMarkup:
@@ -674,6 +817,9 @@ async def send_complete_spread_preview(
     voice_file_id: str,
 ):
     """Send the exact photo+caption+voice sequence without touching the channel."""
+    spread = await asyncio.to_thread(db.get_spread, spread_id)
+    if spread is None:
+        raise ValueError(f"Spread {spread_id} not found")
     back_url = await asyncio.to_thread(db.get_card_back_url)
     collage_path = await asyncio.to_thread(build_collage, back_url, spread_id)
     try:
@@ -681,7 +827,7 @@ async def send_complete_spread_preview(
             await context.bot.send_photo(
                 chat_id=chat_id,
                 photo=InputFile(preview_image),
-                caption=spread_caption(),
+                caption=spread_caption(spread.get("question")),
                 parse_mode="Markdown",
                 reply_markup=spread_visual_preview_keyboard(spread_id),
             )
@@ -1059,6 +1205,123 @@ async def newspread(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Расклад готов. В канал ничего не отправлено.")
 
 
+async def spread_question_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    if query is None or not query.data or not is_admin(update):
+        return
+    try:
+        _, action, spread_id_text = query.data.split(":", 2)
+        spread_id = int(spread_id_text)
+    except (ValueError, IndexError):
+        await query.answer("Не удалось определить расклад.", show_alert=True)
+        return
+
+    spread = await asyncio.to_thread(db.get_spread, spread_id)
+    if spread is None:
+        await query.answer("Расклад не найден.", show_alert=True)
+        return
+
+    if action == "show":
+        context.user_data.pop("pending_spread_question_input", None)
+        context.user_data.pop("pending_spread_question_id", None)
+        await query.answer()
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=spread_question_screen_text(spread.get("question")),
+            parse_mode="HTML",
+            reply_markup=spread_question_keyboard(spread_id),
+        )
+        return
+
+    if action in {"generate", "regenerate"}:
+        await query.answer("Готовлю вариант…")
+        cards, missing = await asyncio.to_thread(
+            db.get_cards, spread["card_ids"]
+        )
+        if missing:
+            notice = "Не удалось подготовить вопрос: часть карт не найдена."
+            question = spread.get("question")
+            keyboard = spread_question_keyboard(
+                spread_id, allow_generate=False
+            )
+        else:
+            try:
+                question = await asyncio.to_thread(
+                    _generate_spread_question, cards
+                )
+                await asyncio.to_thread(
+                    db.update_spread_question, spread_id, question
+                )
+                notice = "✅ Вариант сохранён в раскладе."
+                keyboard = spread_question_keyboard(
+                    spread_id,
+                    allow_generate=False,
+                    allow_regenerate=action == "generate",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not generate question for spread %s: %s",
+                    spread_id,
+                    exc,
+                )
+                question = spread.get("question")
+                notice = "Не удалось подготовить вопрос. Можно написать свой или убрать вопрос."
+                keyboard = spread_question_keyboard(
+                    spread_id, allow_generate=False
+                )
+        await query.edit_message_text(
+            spread_question_screen_text(question, notice),
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        return
+
+    if action == "custom":
+        clear_admin_input_states(context)
+        context.user_data["pending_spread_question_input"] = True
+        context.user_data["pending_spread_question_id"] = spread_id
+        await query.answer()
+        await query.edit_message_text(
+            spread_question_screen_text(
+                spread.get("question"),
+                "Напишите и отправьте свой вопрос одним сообщением.",
+            ),
+            parse_mode="HTML",
+            reply_markup=spread_question_keyboard(
+                spread_id, allow_generate=False
+            ),
+        )
+        return
+
+    if action == "remove":
+        await asyncio.to_thread(db.update_spread_question, spread_id, None)
+        context.user_data.pop("pending_spread_question_input", None)
+        context.user_data.pop("pending_spread_question_id", None)
+        await query.answer("Вопрос убран.")
+        await query.edit_message_text(
+            spread_question_screen_text(None, "✅ Вопрос удалён из расклада."),
+            parse_mode="HTML",
+            reply_markup=spread_question_keyboard(spread_id),
+        )
+        return
+
+    if action == "back":
+        clear_admin_input_states(context)
+        has_voice = bool(await asyncio.to_thread(
+            db.get_setting, _spread_voice_key(spread_id)
+        ))
+        await query.answer()
+        await query.edit_message_text(
+            f"Расклад #{spread_id}. Выберите следующее действие.",
+            reply_markup=spread_preview_keyboard(spread_id, has_voice),
+        )
+        return
+
+    await query.answer("Неизвестное действие.", show_alert=True)
+
+
 async def record_spread_voice_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
@@ -1204,7 +1467,7 @@ async def publish_spread_to_channel(
             message = await application.bot.send_photo(
                 chat_id=CHANNEL_ID,
                 photo=InputFile(image),
-                caption=spread_caption(),
+                caption=spread_caption(spread.get("question")),
                 parse_mode="Markdown",
                 reply_markup=spread_pick_keyboard(spread_id, spread["card_ids"]),
             )
@@ -1577,6 +1840,7 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if action == "cancel-spread":
+        clear_admin_input_states(context)
         scheduled_task = context.application.bot_data.get(
             "spread_publish_tasks", {}
         ).pop(spread_id, None)
@@ -1669,6 +1933,33 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     if is_admin(update) and text == "🏠 Главное меню":
         clear_admin_input_states(context)
         await send_admin_main_menu(context.bot, update.effective_chat.id)
+        return
+
+    if is_admin(update) and context.user_data.get("pending_spread_question_input"):
+        spread_id = context.user_data.get("pending_spread_question_id")
+        try:
+            question = normalize_spread_question(text)
+        except ValueError as exc:
+            await update.message.reply_text(
+                f"❌ {exc}\n\nНапишите более короткий вопрос — не более "
+                f"{SPREAD_QUESTION_MAX_LENGTH} символов."
+            )
+            return
+
+        spread = await asyncio.to_thread(db.get_spread, spread_id)
+        if spread is None:
+            clear_admin_input_states(context)
+            await update.message.reply_text("Расклад не найден.")
+            return
+
+        await asyncio.to_thread(db.update_spread_question, spread_id, question)
+        context.user_data.pop("pending_spread_question_input", None)
+        context.user_data.pop("pending_spread_question_id", None)
+        await update.message.reply_text(
+            spread_question_screen_text(question, "✅ Вопрос сохранён."),
+            parse_mode="HTML",
+            reply_markup=spread_question_keyboard(spread_id),
+        )
         return
 
     if is_admin(update) and context.user_data.get("pending_newspread_menu"):
@@ -2705,6 +2996,8 @@ def clear_admin_input_states(context: ContextTypes.DEFAULT_TYPE):
         "pending_spread_voice_id",
         "pending_card_reflection",
         "pending_reflection_test",
+        "pending_spread_question_input",
+        "pending_spread_question_id",
     ):
         context.user_data.pop(key, None)
 
@@ -2987,6 +3280,12 @@ def main():
         CallbackQueryHandler(
             schedule_spread_callback,
             pattern=r"^schedule-spread:",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            spread_question_callback,
+            pattern=r"^question-spread:",
         )
     )
     application.add_handler(

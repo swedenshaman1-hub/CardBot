@@ -95,17 +95,22 @@ def get_cards(card_ids: list[int]):
     return ordered, missing
 
 
-def save_spread(card_ids: list[int], channel_message_id: int | None = None) -> int:
+def save_spread(
+    card_ids: list[int],
+    channel_message_id: int | None = None,
+    question: str | None = None,
+) -> int:
     client = get_client()
+    payload = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "card_ids": card_ids,
+        "channel_message_id": channel_message_id,
+    }
+    if question is not None:
+        payload["question"] = question
     res = (
         client.table("spreads")
-        .insert(
-            {
-                "created_at": datetime.now(timezone.utc).isoformat(),
-                "card_ids": card_ids,
-                "channel_message_id": channel_message_id,
-            }
-        )
+        .insert(payload)
         .execute()
     )
     return res.data[0]["id"]
@@ -115,6 +120,13 @@ def update_spread_message(spread_id: int, channel_message_id: int):
     client = get_client()
     client.table("spreads").update(
         {"channel_message_id": channel_message_id}
+    ).eq("id", spread_id).execute()
+
+
+def update_spread_question(spread_id: int, question: str | None):
+    client = get_client()
+    client.table("spreads").update(
+        {"question": question}
     ).eq("id", spread_id).execute()
 
 
@@ -133,6 +145,7 @@ def get_published_spreads() -> list[dict]:
             "created_at": row["created_at"],
             "card_ids": row["card_ids"],
             "channel_message_id": row["channel_message_id"],
+            "question": row.get("question"),
         }
         for row in res.data
         if row.get("channel_message_id")
@@ -158,6 +171,7 @@ def get_spread(spread_id: int) -> dict | None:
         "created_at": row["created_at"],
         "card_ids": row["card_ids"],
         "channel_message_id": row["channel_message_id"],
+        "question": row.get("question"),
     }
 
 
