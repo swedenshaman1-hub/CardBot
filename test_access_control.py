@@ -1,7 +1,11 @@
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+from telegram.error import TelegramError
 
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 os.environ.setdefault("ADMIN_ID", "1")
@@ -70,6 +74,71 @@ class MembershipTests(unittest.TestCase):
             bot._member_has_channel_access(
                 SimpleNamespace(status="restricted", is_member=False)
             )
+        )
+
+
+class SpreadPublicationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        handle, self.collage_path = tempfile.mkstemp(suffix=".jpg")
+        os.close(handle)
+        Path(self.collage_path).write_bytes(b"test image")
+        self.telegram = SimpleNamespace(
+            send_photo=AsyncMock(
+                return_value=SimpleNamespace(message_id=501)
+            ),
+            send_voice=AsyncMock(
+                return_value=SimpleNamespace(message_id=502)
+            ),
+            delete_message=AsyncMock(),
+        )
+        self.application = SimpleNamespace(bot=self.telegram, bot_data={})
+        self.spread = {"id": 42, "card_ids": [3, 25, 36, 48, 71, 104]}
+
+    async def test_shared_publication_keeps_caption_and_pick_keyboard(self):
+        with (
+            patch.object(bot.db, "get_card_back_url", return_value=None),
+            patch.object(bot, "build_collage", return_value=self.collage_path),
+            patch.object(bot.db, "set_setting"),
+            patch.object(bot.db, "get_published_spreads", return_value=[]),
+            patch.object(bot.db, "update_spread_message"),
+            patch.object(bot, "record_analytics_event", new=AsyncMock()),
+            patch.object(bot, "schedule_spread_deletion", new=MagicMock()),
+        ):
+            await bot.publish_spread_to_channel(
+                self.application, 42, self.spread, "voice-file-id"
+            )
+
+        photo_call = self.telegram.send_photo.await_args.kwargs
+        self.assertEqual(photo_call["caption"], bot.spread_caption())
+        callbacks = [
+            button.callback_data
+            for row in photo_call["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        self.assertEqual(
+            callbacks,
+            [f"pick:42:{position}" for position in range(1, 7)],
+        )
+        self.telegram.send_voice.assert_awaited_once_with(
+            chat_id=bot.CHANNEL_ID,
+            voice="voice-file-id",
+            caption="🎙 Моё личное послание к сегодняшним картам",
+        )
+
+    async def test_voice_failure_rolls_back_photo(self):
+        self.telegram.send_voice.side_effect = TelegramError("voice failed")
+        with (
+            patch.object(bot.db, "get_card_back_url", return_value=None),
+            patch.object(bot, "build_collage", return_value=self.collage_path),
+        ):
+            with self.assertRaises(bot.AuthorVoicePublishError):
+                await bot.publish_spread_to_channel(
+                    self.application, 42, self.spread, "voice-file-id"
+                )
+
+        self.telegram.delete_message.assert_awaited_once_with(
+            chat_id=bot.CHANNEL_ID,
+            message_id=501,
         )
 
 
