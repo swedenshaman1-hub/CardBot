@@ -191,8 +191,8 @@ class SpreadQuestionCaptionTests(unittest.TestCase):
         )
 
     def test_question_over_limit_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "150"):
-            bot.normalize_spread_question("В" * 151)
+        with self.assertRaisesRegex(ValueError, "70"):
+            bot.normalize_spread_question("В" * 71)
 
     def test_markdown_special_characters_are_escaped(self):
         caption = bot.spread_caption("Что *важно* в [этом]_дне_ и `сейчас`?")
@@ -240,7 +240,7 @@ class SpreadQuestionDatabaseTests(unittest.TestCase):
 class SpreadQuestionInputTests(unittest.IsolatedAsyncioTestCase):
     async def test_over_limit_question_is_rejected_during_input(self):
         message = SimpleNamespace(
-            text="В" * 151,
+            text="В" * 71,
             reply_text=AsyncMock(),
         )
         update = SimpleNamespace(
@@ -256,7 +256,7 @@ class SpreadQuestionInputTests(unittest.IsolatedAsyncioTestCase):
             await bot.handle_private_message(update, context)
         update_question.assert_not_called()
         self.assertTrue(context.user_data["pending_spread_question_input"])
-        self.assertIn("150", message.reply_text.await_args.args[0])
+        self.assertIn("70", message.reply_text.await_args.args[0])
 
 
 if __name__ == "__main__":
