@@ -564,7 +564,7 @@ def reflection_clarification(answer: str) -> str:
     )
 
 
-def spread_caption(intro: str | None = None) -> str:
+def spread_caption() -> str:
     return (
         "🔮 *Карты дня*\n\n"
         "Сегодня я выбрал для вас 6 метафорических карт.\n"
@@ -674,9 +674,6 @@ async def send_complete_spread_preview(
     voice_file_id: str,
 ):
     """Send the exact photo+caption+voice sequence without touching the channel."""
-    intro = await asyncio.to_thread(
-        db.get_setting, _spread_intro_key(spread_id)
-    )
     back_url = await asyncio.to_thread(db.get_card_back_url)
     collage_path = await asyncio.to_thread(build_collage, back_url, spread_id)
     try:
@@ -684,7 +681,7 @@ async def send_complete_spread_preview(
             await context.bot.send_photo(
                 chat_id=chat_id,
                 photo=InputFile(preview_image),
-                caption=spread_caption(intro),
+                caption=spread_caption(),
                 parse_mode="Markdown",
                 reply_markup=spread_visual_preview_keyboard(spread_id),
             )
@@ -1189,22 +1186,17 @@ async def show_complete_preview_callback(
     )
 
 
-async def publish_scheduled_spread(
+class AuthorVoicePublishError(RuntimeError):
+    """Raised after the photo is rolled back because author voice failed."""
+
+
+async def publish_spread_to_channel(
     application: Application,
     spread_id: int,
-    admin_chat_id: int | None = None,
+    spread: dict,
+    voice_file_id: str,
 ):
-    """Publish one prepared spread without a live callback query."""
-    spread = await asyncio.to_thread(db.get_spread, spread_id)
-    if spread is None or spread.get("channel_message_id"):
-        return
-
-    voice_file_id = await asyncio.to_thread(
-        db.get_setting, _spread_voice_key(spread_id)
-    )
-    if not voice_file_id:
-        raise RuntimeError(f"Spread #{spread_id} has no author voice")
-
+    """Publish the shared photo-and-voice channel sequence for one spread."""
     back_url = await asyncio.to_thread(db.get_card_back_url)
     collage_path = await asyncio.to_thread(build_collage, back_url, spread_id)
     try:
@@ -1214,9 +1206,7 @@ async def publish_scheduled_spread(
                 photo=InputFile(image),
                 caption=spread_caption(),
                 parse_mode="Markdown",
-                reply_markup=spread_pick_keyboard(
-                    spread_id, spread["card_ids"]
-                ),
+                reply_markup=spread_pick_keyboard(spread_id, spread["card_ids"]),
             )
     finally:
         os.remove(collage_path)
@@ -1227,7 +1217,7 @@ async def publish_scheduled_spread(
             voice=voice_file_id,
             caption="🎙 Моё личное послание к сегодняшним картам",
         )
-    except TelegramError:
+    except TelegramError as exc:
         try:
             await application.bot.delete_message(
                 chat_id=CHANNEL_ID,
@@ -1235,9 +1225,9 @@ async def publish_scheduled_spread(
             )
         except TelegramError:
             logger.exception(
-                "Could not roll back scheduled photo post %s", spread_id
+                "Could not roll back photo post for spread %s", spread_id
             )
-        raise
+        raise AuthorVoicePublishError from exc
 
     await asyncio.to_thread(
         db.set_setting,
@@ -1249,6 +1239,7 @@ async def publish_scheduled_spread(
     for previous_spread in previous_spreads:
         if previous_spread["id"] == spread_id:
             continue
+
         previous_voice_id = await asyncio.to_thread(
             db.get_setting,
             _spread_channel_voice_key(previous_spread["id"]),
@@ -1259,45 +1250,63 @@ async def publish_scheduled_spread(
                     chat_id=CHANNEL_ID,
                     message_id=int(previous_voice_id),
                 )
-            except (TelegramError, ValueError):
-                logger.exception(
-                    "Could not remove old scheduled voice for spread %s",
+            except (TelegramError, ValueError) as exc:
+                logger.warning(
+                    "Could not delete previous author voice for spread %s: %s",
                     previous_spread["id"],
+                    exc,
                 )
-            await asyncio.to_thread(
-                db.set_setting,
-                _spread_channel_voice_key(previous_spread["id"]),
-                "deleted",
-            )
+            finally:
+                await asyncio.to_thread(
+                    db.set_setting,
+                    _spread_channel_voice_key(previous_spread["id"]),
+                    "deleted",
+                )
+
+        removed = False
         try:
             await application.bot.delete_message(
                 chat_id=CHANNEL_ID,
                 message_id=previous_spread["channel_message_id"],
             )
+            removed = True
+            logger.info(
+                "Deleted previous spread %s before publishing %s",
+                previous_spread["id"],
+                spread_id,
+            )
         except BadRequest as exc:
-            if "message to delete not found" not in str(exc).lower():
-                logger.exception(
-                    "Could not remove old scheduled spread %s",
+            if "message to delete not found" in str(exc).lower():
+                removed = True
+                logger.info(
+                    "Previous spread %s was already absent from the channel",
                     previous_spread["id"],
                 )
-                continue
-        except TelegramError:
-            logger.exception(
-                "Could not remove old scheduled spread %s",
+            else:
+                logger.warning(
+                    "Could not delete previous spread %s: %s",
+                    previous_spread["id"],
+                    exc,
+                )
+        except TelegramError as exc:
+            logger.warning(
+                "Could not delete previous spread %s: %s",
                 previous_spread["id"],
+                exc,
             )
+
+        if not removed:
             continue
-        await asyncio.to_thread(
-            db.clear_spread_message, previous_spread["id"]
-        )
+
+        await asyncio.to_thread(db.clear_spread_message, previous_spread["id"])
         await asyncio.to_thread(
             db.set_setting,
             _auto_delete_setting_key(previous_spread["id"]),
             "deleted",
         )
-        old_task = application.bot_data.get(
-            "spread_delete_tasks", {}
-        ).pop(previous_spread["id"], None)
+        old_task = application.bot_data.get("spread_delete_tasks", {}).pop(
+            previous_spread["id"], None
+        )
         if old_task and not old_task.done():
             old_task.cancel()
 
@@ -1320,6 +1329,27 @@ async def publish_scheduled_spread(
     )
     schedule_spread_deletion(
         application, spread_id, message.message_id, delete_at
+    )
+
+
+async def publish_scheduled_spread(
+    application: Application,
+    spread_id: int,
+    admin_chat_id: int | None = None,
+):
+    """Publish one prepared spread without a live callback query."""
+    spread = await asyncio.to_thread(db.get_spread, spread_id)
+    if spread is None or spread.get("channel_message_id"):
+        return
+
+    voice_file_id = await asyncio.to_thread(
+        db.get_setting, _spread_voice_key(spread_id)
+    )
+    if not voice_file_id:
+        raise RuntimeError(f"Spread #{spread_id} has no author voice")
+
+    await publish_spread_to_channel(
+        application, spread_id, spread, voice_file_id
     )
     await asyncio.to_thread(
         db.set_setting, _scheduled_spread_key(spread_id), "published"
@@ -1589,146 +1619,40 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
-    back_url = await asyncio.to_thread(db.get_card_back_url)
-    intro = await asyncio.to_thread(db.get_setting, _spread_intro_key(spread_id))
-    collage_path = await asyncio.to_thread(build_collage, back_url, spread_id)
     try:
-        with open(collage_path, "rb") as f:
-            message = await context.bot.send_photo(
-                chat_id=CHANNEL_ID,
-                photo=InputFile(f),
-                caption=spread_caption(intro),
-                parse_mode="Markdown",
-                reply_markup=spread_pick_keyboard(spread_id, spread["card_ids"]),
-            )
-    except TelegramError as exc:
-        logger.exception("Could not publish spread %s to channel %s", spread_id, CHANNEL_ID)
-        await query.answer("Не удалось опубликовать. Проверьте, что бот — администратор канала.", show_alert=True)
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text="❌ Не удалось опубликовать расклад в канал. Бот должен быть добавлен в канал администратором с правом публикации.",
+        await publish_spread_to_channel(
+            context.application,
+            spread_id,
+            spread,
+            voice_file_id,
         )
-        return
-    finally:
-        os.remove(collage_path)
-
-    try:
-        voice_message = await context.bot.send_voice(
-            chat_id=CHANNEL_ID,
-            voice=voice_file_id,
-            caption="🎙 Моё личное послание к сегодняшним картам",
-        )
-        await asyncio.to_thread(
-            db.set_setting,
-            _spread_channel_voice_key(spread_id),
-            str(voice_message.message_id),
-        )
-    except TelegramError as exc:
+    except AuthorVoicePublishError as exc:
         logger.exception(
             "Could not publish author voice for spread %s: %s",
             spread_id,
             exc,
         )
-        try:
-            await context.bot.delete_message(
-                chat_id=CHANNEL_ID,
-                message_id=message.message_id,
-            )
-        except TelegramError:
-            logger.exception(
-                "Could not roll back photo post for spread %s", spread_id
-            )
         await query.answer(
             "Голос не отправился. Публикация отменена, попробуйте ещё раз.",
             show_alert=True,
         )
         return
-
-    previous_spreads = await asyncio.to_thread(db.get_published_spreads)
-    for previous_spread in previous_spreads:
-        if previous_spread["id"] == spread_id:
-            continue
-
-        previous_voice_id = await asyncio.to_thread(
-            db.get_setting,
-            _spread_channel_voice_key(previous_spread["id"]),
+    except TelegramError:
+        logger.exception(
+            "Could not publish spread %s to channel %s", spread_id, CHANNEL_ID
         )
-        if previous_voice_id and previous_voice_id != "deleted":
-            try:
-                await context.bot.delete_message(
-                    chat_id=CHANNEL_ID,
-                    message_id=int(previous_voice_id),
-                )
-            except (TelegramError, ValueError) as exc:
-                logger.warning(
-                    "Could not delete previous author voice for spread %s: %s",
-                    previous_spread["id"],
-                    exc,
-                )
-            finally:
-                await asyncio.to_thread(
-                    db.set_setting,
-                    _spread_channel_voice_key(previous_spread["id"]),
-                    "deleted",
-                )
-
-        removed = False
-        try:
-            await context.bot.delete_message(
-                chat_id=CHANNEL_ID,
-                message_id=previous_spread["channel_message_id"],
-            )
-            removed = True
-            logger.info("Deleted previous spread %s before publishing %s", previous_spread["id"], spread_id)
-        except BadRequest as exc:
-            if "message to delete not found" in str(exc).lower():
-                # The post is already absent in Telegram. Clean the stale
-                # database reference exactly as after a successful deletion.
-                removed = True
-                logger.info(
-                    "Previous spread %s was already absent from the channel",
-                    previous_spread["id"],
-                )
-            else:
-                logger.warning(
-                    "Could not delete previous spread %s: %s",
-                    previous_spread["id"],
-                    exc,
-                )
-        except TelegramError as exc:
-            logger.warning("Could not delete previous spread %s: %s", previous_spread["id"], exc)
-
-        if not removed:
-            # Keep its database reference and deletion task so a temporary
-            # Telegram error does not permanently orphan the old post.
-            continue
-
-        await asyncio.to_thread(db.clear_spread_message, previous_spread["id"])
-        await asyncio.to_thread(
-            db.set_setting,
-            _auto_delete_setting_key(previous_spread["id"]),
-            "deleted",
+        await query.answer(
+            "Не удалось опубликовать. Проверьте, что бот — администратор канала.",
+            show_alert=True,
         )
-        old_task = context.application.bot_data.get("spread_delete_tasks", {}).pop(previous_spread["id"], None)
-        if old_task and not old_task.done():
-            old_task.cancel()
-
-    await asyncio.to_thread(db.update_spread_message, spread_id, message.message_id)
-    await record_analytics_event(
-        event_type="spread_published",
-        idempotency_key=f"spread:{spread_id}:published",
-        spread_id=spread_id,
-    )
-    delete_at = time.time() + AUTO_DELETE_SECONDS
-    await asyncio.to_thread(
-        db.set_setting,
-        _auto_delete_setting_key(spread_id),
-        json.dumps(
-            {"message_id": message.message_id, "delete_at": delete_at},
-            separators=(",", ":"),
-        ),
-    )
-    schedule_spread_deletion(application=context.application, spread_id=spread_id, message_id=message.message_id, delete_at=delete_at)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=(
+                "❌ Не удалось опубликовать расклад в канал. Бот должен быть "
+                "добавлен в канал администратором с правом публикации."
+            ),
+        )
+        return
     await query.answer("Расклад опубликован в канале.")
     try:
         await query.edit_message_reply_markup(reply_markup=None)
