@@ -258,6 +258,43 @@ class SpreadQuestionInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(context.user_data["pending_spread_question_input"])
         self.assertIn("70", message.reply_text.await_args.args[0])
 
+    async def test_text_topic_generates_and_saves_question(self):
+        status = SimpleNamespace(edit_text=AsyncMock())
+        message = SimpleNamespace(
+            text="отношения",
+            reply_text=AsyncMock(return_value=status),
+        )
+        update = SimpleNamespace(
+            message=message,
+            effective_user=SimpleNamespace(id=bot.ADMIN_ID),
+            effective_chat=SimpleNamespace(id=bot.ADMIN_ID),
+        )
+        context = SimpleNamespace(user_data={
+            "pending_spread_question_topic": True,
+            "pending_spread_question_topic_id": 7,
+        })
+        with patch.object(
+            bot,
+            "generate_spread_question_for_topic",
+            new=AsyncMock(return_value="Что сейчас важно увидеть в ваших отношениях?"),
+        ) as generate:
+            await bot.handle_private_message(update, context)
+        generate.assert_awaited_once_with(7, "отношения")
+        self.assertNotIn("pending_spread_question_topic", context.user_data)
+        self.assertIn(
+            "Короткий вопрос по вашей теме сохранён",
+            status.edit_text.await_args.args[0],
+        )
+
+    def test_question_keyboard_separates_topic_and_ready_question(self):
+        labels = [
+            button.text
+            for row in bot.spread_question_keyboard(7).inline_keyboard
+            for button in row
+        ]
+        self.assertIn("🎯 Предложить по моей теме", labels)
+        self.assertIn("✍️ Ввести готовый вопрос", labels)
+
 
 if __name__ == "__main__":
     unittest.main()
