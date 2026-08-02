@@ -51,7 +51,7 @@ BOT_LINK = "https://t.me/shamankarty_bot"
 MAX_CARDS_PER_SPREAD = 2
 REFLECTION_PROMPT_VERSION = "v2"
 SPREAD_QUESTION_PROMPT_VERSION = "v1"
-SPREAD_QUESTION_MAX_LENGTH = 150
+SPREAD_QUESTION_MAX_LENGTH = 70
 TELEGRAM_CAPTION_MAX_LENGTH = 1024
 AUTO_DELETE_SECONDS = 72 * 60 * 60
 AUTO_DELETE_SETTING_PREFIX = "spread_auto_delete:"
@@ -489,7 +489,8 @@ def _generate_spread_question(cards: list[dict]) -> str:
 Карты расклада:
 {cards_context}
 
-Сформулируй ровно один открытый вопрос от второго лица — обращайся к человеку на «вы».
+Сформулируй ровно один короткий открытый вопрос от второго лица — обращайся к человеку на «вы».
+Используй от 6 до 10 слов. Вопрос должен легко читаться в Telegram Stories.
 Вопрос должен объединять общий смысл расклада, приглашать к самостоятельному размышлению,
 не допускать ответа только «да» или «нет» и не обещать результат, исцеление или изменение.
 Не ставь диагнозов, не называй скрытых причин и не используй мистические утверждения.
@@ -509,6 +510,9 @@ def _generate_spread_question(cards: list[dict]) -> str:
     question = normalize_spread_question((response.text or "").strip().strip('"'))
     if question.count("?") != 1 or not question.endswith("?"):
         raise RuntimeError("Gemini did not return exactly one question")
+    word_count = len(question[:-1].split())
+    if not 6 <= word_count <= 10:
+        raise RuntimeError("Gemini question must contain 6 to 10 words")
     return question
 
 
