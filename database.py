@@ -17,6 +17,7 @@ CARD_EVENT_TYPES = {
     "voice_sent",
     "reaction_added",
     "reaction_removed",
+    "reflection_feedback",
 }
 
 _client = None
@@ -342,6 +343,11 @@ def _summarise_events(rows: list[dict]) -> dict:
         for row in rows
         if row["event_type"] == "reaction_added" and row.get("reaction_type")
     )
+    reflection_feedback_counts = Counter(
+        row["reaction_type"]
+        for row in rows
+        if row["event_type"] == "reflection_feedback" and row.get("reaction_type")
+    )
     actor_openings: dict[str, set[tuple[int | None, int | None]]] = {}
     for row in rows:
         if row["event_type"] != "card_opened" or not row.get("actor_hash"):
@@ -357,6 +363,7 @@ def _summarise_events(rows: list[dict]) -> dict:
         "card_opened_by_position": dict(sorted(position_counts.items())),
         "card_opened_by_card": dict(card_counts.most_common()),
         "reaction_counts": dict(reaction_counts),
+        "reflection_feedback_counts": dict(reflection_feedback_counts),
         "users_opened_one": sum(len(values) == 1 for values in actor_openings.values()),
         "users_opened_two_or_more": sum(
             len(values) >= 2 for values in actor_openings.values()

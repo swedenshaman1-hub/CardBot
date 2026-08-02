@@ -2176,7 +2176,9 @@ async def card_reaction_callback(
                 parse_mode="HTML",
             )
             context.user_data["pending_card_reflection"] = {
+                "spread_id": spread_id,
                 "card_id": card_id,
+                "position": position,
                 "question": question,
             }
         except Exception as exc:
@@ -2217,14 +2219,69 @@ async def complete_card_reflection(
         )
         return
 
+    spread_id = int(pending.get("spread_id", 0))
+    card_id = int(pending["card_id"])
+    position = int(pending.get("position", 1))
     context.user_data.pop("pending_card_reflection", None)
     await update.message.reply_text(
         "🧭 <b>Ваш разбор</b>\n\n"
         f"{escape(reflection)}\n\n"
         "<i>Это бережное отражение по смыслу карты и вашим словам, "
-        "а не диагностика или личная консультация.</i>",
+        "а не диагностика или личная консультация.</i>\n\n"
+        "<b>Насколько этот разбор вам откликается?</b>",
         parse_mode="HTML",
+        reply_markup=reflection_feedback_keyboard(
+            spread_id, card_id, position
+        ),
     )
+
+
+def reflection_feedback_keyboard(
+    spread_id: int, card_id: int, position: int
+) -> InlineKeyboardMarkup:
+    prefix = f"reflection-feedback:{spread_id}:{card_id}:{position}"
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("🎯 Да, точно", callback_data=f"{prefix}:yes"),
+            InlineKeyboardButton("🤔 Частично", callback_data=f"{prefix}:partly"),
+        ], [
+            InlineKeyboardButton(
+                "❌ Нет, не про меня", callback_data=f"{prefix}:no"
+            )
+        ]]
+    )
+
+
+async def reflection_feedback_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    try:
+        _, spread_text, card_text, position_text, feedback = query.data.split(":")
+        spread_id = int(spread_text)
+        card_id = int(card_text)
+        position = int(position_text)
+    except (ValueError, IndexError):
+        await query.answer("Не удалось сохранить ответ.", show_alert=True)
+        return
+    if feedback not in {"yes", "partly", "no"}:
+        await query.answer("Не удалось сохранить ответ.", show_alert=True)
+        return
+
+    if spread_id != 0:
+        await record_analytics_event(
+            event_type="reflection_feedback",
+            idempotency_key=f"telegram:update:{update.update_id}:reflection_feedback",
+            spread_id=spread_id,
+            card_id=card_id,
+            card_position=position,
+            actor_hash=_actor_hash(query.from_user.id),
+            reaction_type=feedback,
+        )
+    await query.answer("Спасибо, ваш ответ сохранён.", show_alert=False)
+    await query.edit_message_reply_markup(reply_markup=None)
 
 
 def review_keyboard(card_id: int) -> InlineKeyboardMarkup:
@@ -2475,6 +2532,7 @@ async def build_dashboard_text(bot, days: int) -> str:
     data = await asyncio.to_thread(db.get_stats, days)
     counts = data.get("event_counts", {})
     reactions = data.get("reaction_counts", {})
+    feedback = data.get("reflection_feedback_counts", {})
     try:
         subscribers = await bot.get_chat_member_count(CHANNEL_ID)
         subscriber_text = str(subscribers)
@@ -2491,6 +2549,10 @@ async def build_dashboard_text(bot, days: int) -> str:
         f"💫 Мне это близко: <b>{reactions.get('close', 0)}</b>\n"
         f"🌿 Хочу осмыслить: <b>{reactions.get('reflect', 0)}</b>\n"
         f"🤍 Сейчас не откликается: <b>{reactions.get('not_now', 0)}</b>\n\n"
+        "🎯 <b>Точность разбора</b>\n"
+        f"Да, точно: <b>{feedback.get('yes', 0)}</b>\n"
+        f"Частично: <b>{feedback.get('partly', 0)}</b>\n"
+        f"Нет, не про меня: <b>{feedback.get('no', 0)}</b>\n\n"
         "<i>Telegram показывает текущее число подписчиков. История точных "
         "подписок, отписок и просмотров публикаций пока не подключена.</i>"
     )
@@ -2561,6 +2623,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     counts = data.get("event_counts", {})
     reactions = data.get("reaction_counts", {})
+    feedback = data.get("reflection_feedback_counts", {})
     positions = data.get("card_opened_by_position", {})
     position_lines = "\n".join(
         f"• {position} — {positions.get(position, positions.get(str(position), 0))}"
@@ -2580,6 +2643,10 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Мне это близко: <b>{reactions.get('close', 0)}</b>\n"
         f"Хочу осмыслить: <b>{reactions.get('reflect', 0)}</b>\n"
         f"Сейчас не откликается: <b>{reactions.get('not_now', 0)}</b>\n\n"
+        "🎯 <b>Точность разбора</b>\n"
+        f"Да, точно: <b>{feedback.get('yes', 0)}</b>\n"
+        f"Частично: <b>{feedback.get('partly', 0)}</b>\n"
+        f"Нет, не про меня: <b>{feedback.get('no', 0)}</b>\n\n"
         f"🔢 <b>Открытия по позициям</b>\n{position_lines}",
         parse_mode="HTML",
     )
@@ -2884,6 +2951,12 @@ def main():
     application.add_handler(CallbackQueryHandler(voice_callback, pattern=r"^voice:"))
     application.add_handler(
         CallbackQueryHandler(card_reaction_callback, pattern=r"^react:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            reflection_feedback_callback,
+            pattern=r"^reflection-feedback:",
+        )
     )
     application.add_handler(
         CallbackQueryHandler(dashboard_callback, pattern=r"^admin-stats:")
