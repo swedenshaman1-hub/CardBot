@@ -164,12 +164,14 @@ class SpreadPublicationTests(unittest.IsolatedAsyncioTestCase):
     async def test_shared_publication_keeps_caption_and_pick_keyboard(self):
         with (
             patch.object(bot.db, "get_card_back_url", return_value=None),
+            patch.object(bot.db, "get_spread_engagement", return_value={}),
             patch.object(bot, "build_collage", return_value=self.collage_path),
             patch.object(bot.db, "set_setting"),
             patch.object(bot.db, "get_published_spreads", return_value=[]),
             patch.object(bot.db, "update_spread_message"),
             patch.object(bot, "record_analytics_event", new=AsyncMock()),
             patch.object(bot, "schedule_spread_deletion", new=MagicMock()),
+            patch.object(bot, "notify_reminder_subscribers", new=AsyncMock()),
         ):
             await bot.publish_spread_to_channel(
                 self.application, 42, self.spread, "voice-file-id"
@@ -196,6 +198,7 @@ class SpreadPublicationTests(unittest.IsolatedAsyncioTestCase):
         self.telegram.send_voice.side_effect = TelegramError("voice failed")
         with (
             patch.object(bot.db, "get_card_back_url", return_value=None),
+            patch.object(bot.db, "get_spread_engagement", return_value={}),
             patch.object(bot, "build_collage", return_value=self.collage_path),
         ):
             with self.assertRaises(bot.AuthorVoicePublishError):
@@ -212,12 +215,14 @@ class SpreadPublicationTests(unittest.IsolatedAsyncioTestCase):
         self.spread["question"] = "Что вы готовы увидеть иначе?"
         with (
             patch.object(bot.db, "get_card_back_url", return_value=None),
+            patch.object(bot.db, "get_spread_engagement", return_value={}),
             patch.object(bot, "build_collage", return_value=self.collage_path),
             patch.object(bot.db, "set_setting"),
             patch.object(bot.db, "get_published_spreads", return_value=[]),
             patch.object(bot.db, "update_spread_message"),
             patch.object(bot, "record_analytics_event", new=AsyncMock()),
             patch.object(bot, "schedule_spread_deletion", new=MagicMock()),
+            patch.object(bot, "notify_reminder_subscribers", new=AsyncMock()),
         ):
             await bot.publish_spread_to_channel(
                 self.application, 42, self.spread, "voice-file-id"
@@ -357,6 +362,49 @@ class SpreadQuestionInputTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertIn("🎯 Предложить по моей теме", labels)
         self.assertIn("✍️ Ввести готовый вопрос", labels)
+
+
+class AudienceGrowthTests(unittest.TestCase):
+    def test_theme_is_added_without_changing_unthemed_caption(self):
+        plain = bot.spread_caption()
+        themed = bot.spread_caption(
+            engagement={"theme": "Отношения и близость", "day": 3}
+        )
+        self.assertTrue(themed.startswith("📖 *Тема недели · День 3*"))
+        self.assertIn("Отношения и близость", themed)
+        self.assertIn(plain, themed)
+
+    def test_reminder_subscription_can_be_enabled_and_disabled(self):
+        values = {}
+        with (
+            patch.object(db, "get_setting", side_effect=lambda key: values.get(key)),
+            patch.object(db, "set_setting", side_effect=lambda key, value: values.__setitem__(key, value)),
+            patch.object(db, "delete_setting", side_effect=lambda key: values.pop(key, None)),
+        ):
+            db.set_reminder_subscription(55, True)
+            self.assertTrue(db.is_reminder_subscriber(55))
+            db.set_reminder_subscription(55, False)
+            self.assertFalse(db.is_reminder_subscriber(55))
+
+    def test_active_theme_advances_and_cycles_after_seven(self):
+        values = {}
+        with (
+            patch.object(db, "get_setting", side_effect=lambda key: values.get(key)),
+            patch.object(db, "set_setting", side_effect=lambda key, value: values.__setitem__(key, value)),
+            patch.object(db, "delete_setting", side_effect=lambda key: values.pop(key, None)),
+        ):
+            db.set_active_weekly_theme("Отношения")
+            attached = [db.attach_active_theme_to_spread(i) for i in range(1, 9)]
+        self.assertEqual([item.get("day") for item in attached], [1, 2, 3, 4, 5, 6, 7, None])
+
+    def test_weekly_summary_is_anonymous_and_uses_aggregates(self):
+        text = bot.weekly_summary_text(42, {
+            "event_counts": {"card_opened": 20},
+            "reaction_counts": {"close": 6, "reflect": 2, "not_now": 2},
+        })
+        self.assertIn("20", text)
+        self.assertIn("80%", text)
+        self.assertNotIn("42", text)
 
 
 if __name__ == "__main__":
