@@ -27,6 +27,13 @@ CARD_EVENT_TYPES = {
     "reflection_question_shown",
     "reflection_answered",
     "reflection_completed",
+    "reminder_opted_in",
+    "reminder_opted_out",
+    "reminder_sent",
+    "share_requested",
+    "weekly_theme_started",
+    "weekly_summary_published",
+    "weekly_voice_published",
 }
 
 _client = None
@@ -213,6 +220,91 @@ def get_recent_settings(prefix: str, limit: int = 7) -> list[str]:
         .execute()
     )
     return [row["value"] for row in res.data or []]
+
+
+def delete_setting(key: str):
+    get_client().table("settings").delete().eq("key", key).execute()
+
+
+def set_spread_engagement(spread_id: int, data: dict | None):
+    """Persist optional theme metadata without changing the spreads schema."""
+    key = f"spread_engagement:{spread_id}"
+    if data is None:
+        delete_setting(key)
+        return
+    set_setting(key, json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+
+
+def get_spread_engagement(spread_id: int) -> dict:
+    raw = get_setting(f"spread_engagement:{spread_id}")
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else {}
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+
+def set_active_weekly_theme(theme: str | None):
+    """Start or stop the current seven-day editorial cycle."""
+    if theme is None:
+        delete_setting("weekly_theme:active")
+        return
+    payload = {"theme": theme, "next_day": 1, "started_at": datetime.now(timezone.utc).isoformat()}
+    set_setting("weekly_theme:active", json.dumps(payload, ensure_ascii=False))
+
+
+def get_active_weekly_theme() -> dict | None:
+    raw = get_setting("weekly_theme:active")
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw)
+        return value if isinstance(value, dict) and value.get("theme") else None
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+
+def attach_active_theme_to_spread(spread_id: int) -> dict:
+    """Attach the current theme/day to a newly created spread and advance it."""
+    active = get_active_weekly_theme()
+    if not active:
+        return {}
+    day = min(max(int(active.get("next_day", 1)), 1), 7)
+    metadata = {"theme": str(active["theme"]), "day": day}
+    set_spread_engagement(spread_id, metadata)
+    if day >= 7:
+        delete_setting("weekly_theme:active")
+    else:
+        active["next_day"] = day + 1
+        set_setting("weekly_theme:active", json.dumps(active, ensure_ascii=False))
+    return metadata
+
+
+def set_reminder_subscription(user_id: int, enabled: bool):
+    key = f"reminder_user:{int(user_id)}"
+    if enabled:
+        set_setting(key, "1")
+    else:
+        delete_setting(key)
+
+
+def is_reminder_subscriber(user_id: int) -> bool:
+    return get_setting(f"reminder_user:{int(user_id)}") == "1"
+
+
+def get_reminder_subscribers() -> list[int]:
+    rows = get_settings_by_prefix("reminder_user:")
+    result = []
+    for key, value in rows.items():
+        if value != "1":
+            continue
+        try:
+            result.append(int(key.removeprefix("reminder_user:")))
+        except ValueError:
+            continue
+    return result
 
 
 # ── privacy-safe analytics ────────────────────────────────────────────────

@@ -12,6 +12,7 @@ import wave
 from datetime import datetime, timedelta
 from html import escape
 from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 from google import genai
@@ -60,6 +61,7 @@ SPREAD_VOICE_SCRIPT_PREFIX = "spread_voice_script:"
 SPREAD_VOICE_SETTING_PREFIX = "spread_voice:"
 SPREAD_CHANNEL_VOICE_PREFIX = "spread_channel_voice:"
 SCHEDULED_SPREAD_PREFIX = "scheduled_spread:"
+WEEKLY_THEME_MAX_LENGTH = 60
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 logging.basicConfig(level=logging.INFO)
@@ -639,7 +641,10 @@ def escape_markdown_question(question: str) -> str:
     return escaped
 
 
-def spread_caption(question: str | None = None) -> str:
+def spread_caption(
+    question: str | None = None,
+    engagement: dict | None = None,
+) -> str:
     intro = (
         "🔮 *Карты дня*\n\n"
         "Сегодня я выбрал для вас 6 метафорических карт.\n"
@@ -651,14 +656,19 @@ def spread_caption(question: str | None = None) -> str:
         "В каждой новой публикации вы можете открывать для себя две карты.\n\n"
         "Если вам откликнулось послание, оставьте реакцию — пусть это будет наш энергообмен."
     )
+    themed_intro = intro
+    if engagement and engagement.get("theme"):
+        theme = escape_markdown_question(str(engagement["theme"]))
+        day = int(engagement.get("day", 1))
+        themed_intro = f"📖 *Тема недели · День {day}*\n{theme}\n\n{intro}"
     if question is None:
-        caption = f"{intro}\n\n{remainder}"
+        caption = f"{themed_intro}\n\n{remainder}"
     else:
         safe_question = escape_markdown_question(
             normalize_spread_question(question)
         )
         caption = (
-            f"{intro}\n\n"
+            f"{themed_intro}\n\n"
             f"❓ *Вопрос дня*\n{safe_question}\n\n"
             f"{remainder}"
         )
@@ -859,6 +869,7 @@ async def send_complete_spread_preview(
     spread = await asyncio.to_thread(db.get_spread, spread_id)
     if spread is None:
         raise ValueError(f"Spread {spread_id} not found")
+    engagement = await asyncio.to_thread(db.get_spread_engagement, spread_id)
     back_url = await asyncio.to_thread(db.get_card_back_url)
     collage_path = await asyncio.to_thread(build_collage, back_url, spread_id)
     try:
@@ -866,7 +877,7 @@ async def send_complete_spread_preview(
             await context.bot.send_photo(
                 chat_id=chat_id,
                 photo=InputFile(preview_image),
-                caption=spread_caption(spread.get("question")),
+                caption=spread_caption(spread.get("question"), engagement),
                 parse_mode="Markdown",
                 reply_markup=spread_visual_preview_keyboard(spread_id),
             )
@@ -991,6 +1002,38 @@ def card_reaction_keyboard(
     )
 
 
+def card_followup_keyboard(
+    spread_id: int, card_id: int, position: int, *, reminder_enabled: bool = False
+) -> InlineKeyboardMarkup:
+    reminder_label = (
+        "🔕 Не напоминать о новых картах"
+        if reminder_enabled
+        else "🔔 Напомнить о следующем раскладе"
+    )
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            reminder_label,
+            callback_data=f"reminder:{'off' if reminder_enabled else 'on'}:{spread_id}:{card_id}:{position}",
+        )],
+        [InlineKeyboardButton(
+            "✨ Поделиться посланием",
+            callback_data=f"share:{spread_id}:{card_id}:{position}",
+        )],
+    ])
+
+
+def share_message_url(card_id: int) -> str:
+    text = (
+        "Сегодня мне открылось метафорическое послание. "
+        "Если вам интересно услышать своё — загляните в «Карту дня»."
+    )
+    return (
+        "https://t.me/share/url?url="
+        f"{quote(BOT_LINK + '?start=shared_' + str(card_id), safe='')}"
+        f"&text={quote(text, safe='')}"
+    )
+
+
 async def send_card_to_chat(
     bot,
     chat_id: int,
@@ -1052,6 +1095,29 @@ async def send_card_voice(bot, chat_id: int, card_id: int):
                 pass
 
 
+async def notify_reminder_subscribers(application: Application, spread_id: int):
+    """Notify only users who explicitly opted in; disable unreachable chats."""
+    user_ids = await asyncio.to_thread(db.get_reminder_subscribers)
+    for user_id in user_ids:
+        try:
+            await application.bot.send_message(
+                chat_id=user_id,
+                text="🔮 Новый расклад уже опубликован. Выберите карту, которая откликается вам сегодня.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Открыть публикацию", url=f"https://t.me/{str(CHANNEL_ID).lstrip('@')}")
+                ]]),
+            )
+            await record_analytics_event(
+                event_type="reminder_sent",
+                idempotency_key=f"spread:{spread_id}:reminder:{user_id}",
+                spread_id=spread_id,
+                actor_hash=_actor_hash(user_id),
+            )
+        except TelegramError as exc:
+            logger.info("Disabling unreachable reminder subscriber: %s", exc)
+            await asyncio.to_thread(db.set_reminder_subscription, user_id, False)
+
+
 async def _save_card_image(update: Update, context: ContextTypes.DEFAULT_TYPE, file_bytes: bytes):
     """Common logic after getting file_bytes from photo or document."""
     caption = (update.message.caption or "").strip()
@@ -1093,6 +1159,7 @@ async def addcard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin sends card as photo (Telegram-compressed)."""
     if not is_admin(update):
         return
+
     if not update.message.photo:
         await update.message.reply_text(
             "Пришли фото карты с номером в подписи, например: <code>5</code>",
@@ -1140,6 +1207,21 @@ async def handle_admin_voice(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if not is_admin(update):
+        return
+
+    if context.user_data.get("pending_weekly_voice"):
+        voice = update.message.voice
+        await asyncio.to_thread(db.set_setting, "weekly_voice:pending", voice.file_id)
+        context.user_data.pop("pending_weekly_voice", None)
+        await update.message.reply_voice(
+            voice=voice.file_id,
+            caption="👁 Предпросмотр: личный итог недели",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Опубликовать в канал", callback_data="engagement-admin:voice-publish")],
+                [InlineKeyboardButton("🔄 Перезаписать", callback_data="engagement-admin:voice")],
+                [InlineKeyboardButton("✖️ Отменить", callback_data="admin-menu:engagement")],
+            ]),
+        )
         return
 
     pending_topic_spread_id = context.user_data.get(
@@ -1253,13 +1335,29 @@ async def newspread(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Все ID должны быть числами.")
         return
 
-    _, missing = await asyncio.to_thread(db.get_cards, card_ids)
+    cards, missing = await asyncio.to_thread(db.get_cards, card_ids)
     if missing:
         await update.message.reply_text(f"Не найдены карты с ID: {missing}")
         return
 
     back_url = await asyncio.to_thread(db.get_card_back_url)
     spread_id = await asyncio.to_thread(db.save_spread, card_ids)
+    engagement = await asyncio.to_thread(db.attach_active_theme_to_spread, spread_id)
+    generated_question = None
+    if engagement.get("theme"):
+        try:
+            generated_question = await asyncio.to_thread(
+                _generate_spread_question, cards, engagement["theme"]
+            )
+            await asyncio.to_thread(
+                db.update_spread_question, spread_id, generated_question
+            )
+        except Exception as exc:
+            logger.warning(
+                "Weekly theme question was not generated for spread %s: %s",
+                spread_id,
+                exc,
+            )
     collage_path = await asyncio.to_thread(build_collage, back_url, spread_id)
     mapping = "\n".join(
         f"{position} → карта №{card_id}"
@@ -1271,7 +1369,7 @@ async def newspread(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=update.effective_chat.id,
             photo=InputFile(f),
             caption=(
-                f"{spread_caption()}\n\n"
+                f"{spread_caption(generated_question, engagement)}\n\n"
                 f"*Порядок карт для проверки:*\n{mapping}\n\n"
                 "Если всё верно, опубликуй сейчас или запланируй дату и время."
             ),
@@ -1559,6 +1657,7 @@ async def publish_spread_to_channel(
     voice_file_id: str,
 ):
     """Publish the shared photo-and-voice channel sequence for one spread."""
+    engagement = await asyncio.to_thread(db.get_spread_engagement, spread_id)
     back_url = await asyncio.to_thread(db.get_card_back_url)
     collage_path = await asyncio.to_thread(build_collage, back_url, spread_id)
     try:
@@ -1566,7 +1665,7 @@ async def publish_spread_to_channel(
             message = await application.bot.send_photo(
                 chat_id=CHANNEL_ID,
                 photo=InputFile(image),
-                caption=spread_caption(spread.get("question")),
+                caption=spread_caption(spread.get("question"), engagement),
                 parse_mode="Markdown",
                 reply_markup=spread_pick_keyboard(spread_id, spread["card_ids"]),
             )
@@ -1692,6 +1791,7 @@ async def publish_spread_to_channel(
     schedule_spread_deletion(
         application, spread_id, message.message_id, delete_at
     )
+    asyncio.create_task(notify_reminder_subscribers(application, spread_id))
 
 
 async def publish_scheduled_spread(
@@ -2032,6 +2132,25 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     if is_admin(update) and text == "🏠 Главное меню":
         clear_admin_input_states(context)
         await send_admin_main_menu(context.bot, update.effective_chat.id)
+        return
+
+    if is_admin(update) and context.user_data.get("pending_weekly_theme"):
+        theme = " ".join(text.split())
+        if not theme or len(theme) > WEEKLY_THEME_MAX_LENGTH:
+            await update.message.reply_text(
+                f"Название должно быть от 1 до {WEEKLY_THEME_MAX_LENGTH} символов."
+            )
+            return
+        await asyncio.to_thread(db.set_active_weekly_theme, theme)
+        context.user_data.pop("pending_weekly_theme", None)
+        await record_analytics_event(
+            event_type="weekly_theme_started",
+            idempotency_key=f"telegram:update:{update.update_id}:weekly_theme_started",
+            metadata={"theme": theme},
+        )
+        await update.message.reply_text(
+            f"✅ Тема недели «{theme}» сохранена. Следующий расклад получит отметку «День 1»."
+        )
         return
 
     if is_admin(update) and context.user_data.get("pending_spread_question_topic"):
@@ -2633,10 +2752,93 @@ async def card_reaction_callback(
             )
         return
 
+    reminder_enabled = False
     try:
-        await query.edit_message_text(responses[reaction])
+        reminder_enabled = await asyncio.to_thread(
+            db.is_reminder_subscriber, query.from_user.id
+        )
+    except Exception as exc:
+        logger.warning("Could not read reminder preference: %s", exc)
+    try:
+        await query.edit_message_text(
+            responses[reaction],
+            reply_markup=card_followup_keyboard(
+                spread_id, card_id, position, reminder_enabled=reminder_enabled
+            ),
+        )
     except TelegramError:
-        await context.bot.send_message(query.from_user.id, responses[reaction])
+        await context.bot.send_message(
+            query.from_user.id,
+            responses[reaction],
+            reply_markup=card_followup_keyboard(
+                spread_id, card_id, position, reminder_enabled=reminder_enabled
+            ),
+        )
+
+
+async def reminder_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+
+    try:
+        _, action, spread_text, card_text, position_text = query.data.split(":")
+        spread_id, card_id, position = map(int, (spread_text, card_text, position_text))
+    except (ValueError, IndexError):
+        await query.answer("Не удалось изменить напоминание.", show_alert=True)
+        return
+    enabled = action == "on"
+    if action not in {"on", "off"}:
+        await query.answer("Не удалось изменить напоминание.", show_alert=True)
+        return
+    await asyncio.to_thread(db.set_reminder_subscription, query.from_user.id, enabled)
+    await record_analytics_event(
+        event_type="reminder_opted_in" if enabled else "reminder_opted_out",
+        idempotency_key=f"telegram:update:{update.update_id}:reminder:{action}",
+        spread_id=spread_id,
+        card_id=card_id,
+        card_position=position,
+        actor_hash=_actor_hash(query.from_user.id),
+    )
+    await query.answer(
+        "Напомню о следующем раскладе." if enabled else "Напоминания выключены."
+    )
+    await query.edit_message_reply_markup(
+        reply_markup=card_followup_keyboard(
+            spread_id, card_id, position, reminder_enabled=enabled
+        )
+    )
+
+
+async def share_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query is None or not query.data:
+        return
+    try:
+        _, spread_text, card_text, position_text = query.data.split(":")
+        spread_id, card_id, position = map(int, (spread_text, card_text, position_text))
+    except (ValueError, IndexError):
+        await query.answer("Не удалось подготовить публикацию.", show_alert=True)
+        return
+    await record_analytics_event(
+        event_type="share_requested",
+        idempotency_key=f"telegram:update:{update.update_id}:share_requested",
+        spread_id=spread_id,
+        card_id=card_id,
+        card_position=position,
+        actor_hash=_actor_hash(query.from_user.id),
+    )
+    await query.answer()
+    await context.bot.send_message(
+        chat_id=query.from_user.id,
+        text=(
+            "✨ Поделитесь не личным ответом, а приглашением получить своё "
+            "метафорическое послание."
+        ),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Выбрать, кому отправить", url=share_message_url(card_id))
+        ]]),
+    )
 
 
 async def complete_card_reflection(
@@ -2746,7 +2948,18 @@ async def reflection_feedback_callback(
             metadata={"prompt_version": REFLECTION_PROMPT_VERSION},
         )
     await query.answer("Спасибо, ваш ответ сохранён.", show_alert=False)
-    await query.edit_message_reply_markup(reply_markup=None)
+    reminder_enabled = False
+    try:
+        reminder_enabled = await asyncio.to_thread(
+            db.is_reminder_subscriber, query.from_user.id
+        )
+    except Exception as exc:
+        logger.warning("Could not read reminder preference: %s", exc)
+    await query.edit_message_reply_markup(
+        reply_markup=card_followup_keyboard(
+            spread_id, card_id, position, reminder_enabled=reminder_enabled
+        )
+    )
 
 
 def review_keyboard(card_id: int) -> InlineKeyboardMarkup:
@@ -3061,6 +3274,10 @@ async def build_dashboard_text(bot, days: int) -> str:
     reactions = data.get("reaction_counts", {})
     feedback = data.get("reflection_feedback_counts", {})
     try:
+        active_reminders = len(await asyncio.to_thread(db.get_reminder_subscribers))
+    except Exception:
+        active_reminders = 0
+    try:
         subscribers = await bot.get_chat_member_count(CHANNEL_ID)
         subscriber_text = str(subscribers)
     except TelegramError:
@@ -3073,6 +3290,10 @@ async def build_dashboard_text(bot, days: int) -> str:
         f"🃏 Успешно открыто карт: <b>{counts.get('card_opened', 0)}</b>\n"
         f"\n{format_card_delivery_funnel(data)}\n"
         f"🎧 Запросов озвучивания: <b>{counts.get('voice_requested', 0)}</b>\n\n"
+        "🔁 <b>Возвращаемость и распространение</b>\n"
+        f"Активно ждут следующий расклад: <b>{active_reminders}</b>\n"
+        f"Напоминаний отправлено: <b>{counts.get('reminder_sent', 0)}</b>\n"
+        f"Запросили пересылку: <b>{counts.get('share_requested', 0)}</b>\n\n"
         "💬 <b>Отклики</b>\n"
         f"💫 Мне это близко: <b>{reactions.get('close', 0)}</b>\n"
         f"🌿 Хочу осмыслить: <b>{reactions.get('reflect', 0)}</b>\n"
@@ -3219,6 +3440,7 @@ def admin_main_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("📊 Аналитика", callback_data="admin-menu:analytics")],
             [InlineKeyboardButton("🔮 Создать расклад", callback_data="admin-menu:newspread")],
             [InlineKeyboardButton("🕗 Запланированные публикации", callback_data="admin-menu:scheduled")],
+            [InlineKeyboardButton("📖 Темы, итоги и напоминания", callback_data="admin-menu:engagement")],
             [InlineKeyboardButton("🃏 Проверить карту", callback_data="admin-menu:review")],
             [InlineKeyboardButton("🧪 Проверить диалог", callback_data="admin-menu:test")],
             [InlineKeyboardButton("❓ Помощь", callback_data="admin-menu:help")],
@@ -3239,6 +3461,8 @@ def clear_admin_input_states(context: ContextTypes.DEFAULT_TYPE):
         "pending_spread_question_id",
         "pending_spread_question_topic",
         "pending_spread_question_topic_id",
+        "pending_weekly_theme",
+        "pending_weekly_voice",
     ):
         context.user_data.pop(key, None)
 
@@ -3299,6 +3523,28 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             "Отправьте шесть номеров карт через пробел в нужном порядке.\n"
             "Например: <code>3 25 36 48 71 104</code>"
         )
+    elif section == "engagement":
+        clear_admin_input_states(context)
+        active = await asyncio.to_thread(db.get_active_weekly_theme)
+        theme_text = (
+            f"<b>{escape(active['theme'])}</b> · следующий день {active.get('next_day', 1)}"
+            if active else "<i>не задана</i>"
+        )
+        await query.edit_message_text(
+            "📖 <b>Темы, итоги и напоминания</b>\n\n"
+            f"Активная тема недели: {theme_text}\n\n"
+            "Новая тема автоматически добавляется к следующим семи раскладам. "
+            "Итог публикуется только после вашего подтверждения.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✍️ Задать тему недели", callback_data="engagement-admin:theme")],
+                [InlineKeyboardButton("⏹ Завершить тему", callback_data="engagement-admin:theme-stop")],
+                [InlineKeyboardButton("📊 Предпросмотр анонимного итога", callback_data="engagement-admin:summary")],
+                [InlineKeyboardButton("🎙 Записать итог недели", callback_data="engagement-admin:voice")],
+                [InlineKeyboardButton("⬅️ Главное меню", callback_data="admin-menu:home")],
+            ]),
+        )
+        return
     elif section == "review":
         clear_admin_input_states(context)
         context.user_data["pending_review_menu"] = True
@@ -3343,6 +3589,104 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             [[InlineKeyboardButton("⬅️ Главное меню", callback_data="admin-menu:home")]]
         ),
     )
+
+
+def weekly_summary_text(spread_id: int, data: dict) -> str:
+    counts = data.get("event_counts", {})
+    reactions = data.get("reaction_counts", {})
+    opened = int(counts.get("card_opened", 0))
+    close = int(reactions.get("close", 0))
+    reflect = int(reactions.get("reflect", 0))
+    not_now = int(reactions.get("not_now", 0))
+    total_reactions = close + reflect + not_now
+    positive = round((close + reflect) * 100 / total_reactions) if total_reactions else 0
+    return (
+        "✨ <b>Как откликнулся сегодняшний расклад</b>\n\n"
+        f"Карты были открыты <b>{opened}</b> раз.\n"
+        f"Послание оказалось близким или дало повод для осмысления в <b>{positive}%</b> откликов.\n\n"
+        "Спасибо каждому, кто остановился, почувствовал и честно ответил себе. "
+        "Завтра наше путешествие продолжится."
+    )
+
+
+async def engagement_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query is None or not query.data or not is_admin(update):
+        return
+    action = query.data.split(":", 1)[1]
+    await query.answer()
+    if action == "theme":
+        clear_admin_input_states(context)
+        context.user_data["pending_weekly_theme"] = True
+        await query.edit_message_text(
+            "📖 Напишите короткое название темы недели одним сообщением.\n\n"
+            "Например: <b>Отношения и близость</b>",
+            parse_mode="HTML",
+        )
+        return
+    if action == "theme-stop":
+        await asyncio.to_thread(db.set_active_weekly_theme, None)
+        await query.edit_message_text(
+            "✅ Тематическая неделя завершена. Новые расклады снова будут без отметки темы.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Главное меню", callback_data="admin-menu:home")
+            ]]),
+        )
+        return
+    if action == "summary":
+        spread = await asyncio.to_thread(db.get_latest_spread)
+        if not spread:
+            await query.edit_message_text("Нет опубликованного расклада для итога.")
+            return
+        data = await asyncio.to_thread(db.get_spread_stats, spread["id"])
+        await query.edit_message_text(
+            "👁 <b>Предпросмотр анонимного итога</b>\n\n" + weekly_summary_text(spread["id"], data),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Опубликовать итог", callback_data=f"engagement-admin:summary-publish-{spread['id']}")],
+                [InlineKeyboardButton("⬅️ Не публиковать", callback_data="admin-menu:engagement")],
+            ]),
+        )
+        return
+    if action.startswith("summary-publish-"):
+        spread_id = int(action.rsplit("-", 1)[1])
+        data = await asyncio.to_thread(db.get_spread_stats, spread_id)
+        sent = await context.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=weekly_summary_text(spread_id, data),
+            parse_mode="HTML",
+        )
+        await record_analytics_event(
+            event_type="weekly_summary_published",
+            idempotency_key=f"spread:{spread_id}:weekly_summary:{sent.message_id}",
+            spread_id=spread_id,
+        )
+        await query.edit_message_text("✅ Анонимный итог опубликован в канале.")
+        return
+    if action == "voice":
+        clear_admin_input_states(context)
+        context.user_data["pending_weekly_voice"] = True
+        await query.edit_message_text(
+            "🎙 Отправьте голосовое с вашим живым итогом недели. "
+            "Сначала бот покажет предпросмотр — без подтверждения в канал ничего не уйдёт."
+        )
+        return
+    if action == "voice-publish":
+        voice_file_id = await asyncio.to_thread(db.get_setting, "weekly_voice:pending")
+        if not voice_file_id:
+            await query.answer("Голосовое не найдено.", show_alert=True)
+            return
+        sent = await context.bot.send_voice(
+            chat_id=CHANNEL_ID,
+            voice=voice_file_id,
+            caption="🎙 Личный итог недели от Дмитрия",
+        )
+        await record_analytics_event(
+            event_type="weekly_voice_published",
+            idempotency_key=f"weekly_voice:{sent.message_id}",
+        )
+        await asyncio.to_thread(db.delete_setting, "weekly_voice:pending")
+        await query.edit_message_text("✅ Ваш итог недели опубликован в канале.")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3552,6 +3896,12 @@ def main():
         CallbackQueryHandler(card_reaction_callback, pattern=r"^react:")
     )
     application.add_handler(
+        CallbackQueryHandler(reminder_callback, pattern=r"^reminder:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(share_callback, pattern=r"^share:")
+    )
+    application.add_handler(
         CallbackQueryHandler(
             reflection_feedback_callback,
             pattern=r"^reflection-feedback:",
@@ -3562,6 +3912,9 @@ def main():
     )
     application.add_handler(
         CallbackQueryHandler(admin_menu_callback, pattern=r"^admin-menu:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(engagement_admin_callback, pattern=r"^engagement-admin:")
     )
     application.add_handler(
         CallbackQueryHandler(
