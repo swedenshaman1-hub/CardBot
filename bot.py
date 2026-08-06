@@ -2261,24 +2261,50 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
     card_id = spread["card_ids"][position - 1]
     card = await asyncio.to_thread(db.get_card, card_id)
     if card is None:
+        await asyncio.to_thread(
+            db.release_spread_selection,
+            spread["id"],
+            update.effective_user.id,
+            position,
+        )
         await update.message.reply_text("Карта не найдена.")
         return
 
-    await send_card_to_chat(
-        context.bot,
-        update.effective_chat.id,
-        card_id,
-        spread["id"],
-        position,
-    )
-    await record_analytics_event(
-        event_type="card_opened",
-        idempotency_key=f"telegram:update:{update.update_id}:card_opened",
-        spread_id=spread["id"],
-        card_id=card_id,
-        card_position=position,
-        actor_hash=_actor_hash(update.effective_user.id),
-    )
+    try:
+        await send_card_to_chat(
+            context.bot,
+            update.effective_chat.id,
+            card_id,
+            spread["id"],
+            position,
+        )
+        await record_analytics_event(
+            event_type="card_opened",
+            idempotency_key=f"telegram:update:{update.update_id}:card_opened",
+            spread_id=spread["id"],
+            card_id=card_id,
+            card_position=position,
+            actor_hash=_actor_hash(update.effective_user.id),
+        )
+    except Exception as exc:
+        await asyncio.to_thread(
+            db.release_spread_selection,
+            spread["id"],
+            update.effective_user.id,
+            position,
+        )
+        await record_analytics_event(
+            event_type="card_delivery_failed",
+            idempotency_key=f"telegram:update:{update.update_id}:card_delivery_failed",
+            spread_id=spread["id"],
+            card_id=card_id,
+            card_position=position,
+            actor_hash=_actor_hash(update.effective_user.id),
+        )
+        logger.exception("Could not send selected card from private message", exc_info=exc)
+        await update.message.reply_text(
+            "Не удалось отправить карту. Попробуйте выбрать её ещё раз."
+        )
 
 
 async def select_card_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2327,6 +2353,7 @@ async def select_card_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     card_id = spread["card_ids"][position - 1]
+    attempt_id = str(update.update_id)
     await record_analytics_event(
         event_type="card_button_clicked",
         idempotency_key=f"telegram:update:{update.update_id}:card_button_clicked",
@@ -2334,10 +2361,20 @@ async def select_card_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         card_id=card_id,
         card_position=position,
         actor_hash=_actor_hash(query.from_user.id),
+        metadata={"attempt_id": attempt_id},
     )
 
     allowed, message = await require_channel_subscription(context.bot, query.from_user.id)
     if not allowed:
+        await record_analytics_event(
+            event_type="card_rejected_subscription",
+            idempotency_key=f"telegram:update:{update.update_id}:card_rejected_subscription",
+            spread_id=spread["id"],
+            card_id=card_id,
+            card_position=position,
+            actor_hash=_actor_hash(query.from_user.id),
+            metadata={"attempt_id": attempt_id},
+        )
         await query.answer(message, show_alert=True)
         return
 
@@ -2346,9 +2383,18 @@ async def select_card_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         await context.bot.send_chat_action(query.from_user.id, "typing")
     except TelegramError:
+        await record_analytics_event(
+            event_type="card_rejected_bot_not_started",
+            idempotency_key=f"telegram:update:{update.update_id}:card_rejected_bot_not_started",
+            spread_id=spread["id"],
+            card_id=card_id,
+            card_position=position,
+            actor_hash=_actor_hash(query.from_user.id),
+            metadata={"attempt_id": attempt_id},
+        )
         await query.answer(
             "Откройте бота и нажмите Start — карта придёт автоматически.",
-            url=f"{BOT_LINK}?start=spread_{spread_id}_{position}",
+            url=f"{BOT_LINK}?start=spread_{spread_id}_{position}_{attempt_id}",
         )
         return
 
@@ -2360,12 +2406,30 @@ async def select_card_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         MAX_CARDS_PER_SPREAD,
     )
     if not claim["allowed"]:
+        await record_analytics_event(
+            event_type="card_rejected_limit",
+            idempotency_key=f"telegram:update:{update.update_id}:card_rejected_limit",
+            spread_id=spread["id"],
+            card_id=card_id,
+            card_position=position,
+            actor_hash=_actor_hash(query.from_user.id),
+            metadata={"attempt_id": attempt_id},
+        )
         await query.answer(
             "Ты уже выбрал две карты в этом раскладе. Третью открыть нельзя.",
             show_alert=True,
         )
         return
     if not claim["is_new"]:
+        await record_analytics_event(
+            event_type="card_rejected_duplicate",
+            idempotency_key=f"telegram:update:{update.update_id}:card_rejected_duplicate",
+            spread_id=spread["id"],
+            card_id=card_id,
+            card_position=position,
+            actor_hash=_actor_hash(query.from_user.id),
+            metadata={"attempt_id": attempt_id},
+        )
         await query.answer(
             "Эту карту ты уже выбрал. Она входит в твои две карты дня.",
             show_alert=True,
@@ -2390,7 +2454,31 @@ async def select_card_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             card_position=position,
             actor_hash=_actor_hash(query.from_user.id),
         )
+        await record_analytics_event(
+            event_type="card_delivery_succeeded",
+            idempotency_key=f"telegram:update:{update.update_id}:card_delivery_succeeded",
+            spread_id=spread["id"],
+            card_id=card_id,
+            card_position=position,
+            actor_hash=_actor_hash(query.from_user.id),
+            metadata={"attempt_id": attempt_id},
+        )
     except Exception as exc:
+        await asyncio.to_thread(
+            db.release_spread_selection,
+            spread["id"],
+            query.from_user.id,
+            position,
+        )
+        await record_analytics_event(
+            event_type="card_delivery_failed",
+            idempotency_key=f"telegram:update:{update.update_id}:card_delivery_failed",
+            spread_id=spread["id"],
+            card_id=card_id,
+            card_position=position,
+            actor_hash=_actor_hash(query.from_user.id),
+            metadata={"attempt_id": attempt_id},
+        )
         logger.exception("Could not send selected card", exc_info=exc)
 
 
@@ -2946,6 +3034,27 @@ def format_reflection_quality(data: dict) -> str:
     )
 
 
+def format_card_delivery_funnel(data: dict) -> str:
+    outcomes = data.get("button_outcome_counts", {})
+    tracked = int(data.get("tracked_button_attempts", 0))
+    legacy = int(data.get("legacy_button_clicks", 0))
+    delivered = int(outcomes.get("delivered", 0))
+    conversion = round(delivered * 100 / tracked) if tracked else 0
+    return (
+        "📍 <b>Результаты нажатий</b> <i>(с момента обновления)</i>\n"
+        f"Отслежено попыток: <b>{tracked}</b>\n"
+        f"Карты доставлены: <b>{delivered}</b>"
+        + (f" ({conversion}%)\n" if tracked else "\n")
+        + f"Не подписаны: <b>{outcomes.get('subscription', 0)}</b>\n"
+        + f"Повторно нажали ту же карту: <b>{outcomes.get('duplicate', 0)}</b>\n"
+        + f"Превысили лимит двух карт: <b>{outcomes.get('limit', 0)}</b>\n"
+        + f"Ожидается запуск бота: <b>{outcomes.get('waiting_for_start', 0)}</b>\n"
+        + f"Технические ошибки: <b>{outcomes.get('delivery_failed', 0)}</b>\n"
+        + f"Не классифицировано: <b>{outcomes.get('unclassified', 0)}</b>\n"
+        + f"Старых нажатий без детализации: <b>{legacy}</b>"
+    )
+
+
 async def build_dashboard_text(bot, days: int) -> str:
     data = await asyncio.to_thread(db.get_stats, days)
     counts = data.get("event_counts", {})
@@ -2962,6 +3071,7 @@ async def build_dashboard_text(bot, days: int) -> str:
         f"👤 Получили хотя бы одну карту: <b>{data.get('unique_card_openers', 0)}</b>\n"
         f"🔢 Нажатий на номера: <b>{counts.get('card_button_clicked', 0)}</b>\n"
         f"🃏 Успешно открыто карт: <b>{counts.get('card_opened', 0)}</b>\n"
+        f"\n{format_card_delivery_funnel(data)}\n"
         f"🎧 Запросов озвучивания: <b>{counts.get('voice_requested', 0)}</b>\n\n"
         "💬 <b>Отклики</b>\n"
         f"💫 Мне это близко: <b>{reactions.get('close', 0)}</b>\n"
@@ -3055,6 +3165,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Успешно открыто: <b>{counts.get('card_opened', 0)}</b>\n"
         f"Открыли одну карту: <b>{data.get('users_opened_one', 0)}</b>\n"
         f"Открыли две: <b>{data.get('users_opened_two_or_more', 0)}</b>\n\n"
+        f"{format_card_delivery_funnel(data)}\n\n"
         "🎧 <b>Голос</b>\n"
         f"Запросили: <b>{counts.get('voice_requested', 0)}</b>\n"
         f"Получили: <b>{counts.get('voice_sent', 0)}</b>\n\n"
@@ -3238,13 +3349,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         token = context.args[0]
         parts = token.split("_")
-        if len(parts) == 3 and parts[0] == "spread":
+        if len(parts) in {3, 4} and parts[0] == "spread":
             try:
                 spread_id = int(parts[1])
                 position = int(parts[2])
+                attempt_id = parts[3] if len(parts) == 4 else None
             except ValueError:
                 spread_id = None
                 position = None
+                attempt_id = None
 
             if spread_id is not None and position is not None:
                 spread = await asyncio.to_thread(db.get_spread, spread_id)
@@ -3256,6 +3369,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context.bot, update.effective_user.id
                 )
                 if not allowed:
+                    if attempt_id:
+                        await record_analytics_event(
+                            event_type="card_rejected_subscription",
+                            idempotency_key=(
+                                f"telegram:attempt:{attempt_id}:card_rejected_subscription"
+                            ),
+                            spread_id=spread_id,
+                            card_position=position,
+                            actor_hash=_actor_hash(update.effective_user.id),
+                            metadata={"attempt_id": attempt_id},
+                        )
                     await update.message.reply_text(message)
                     return
 
@@ -3267,32 +3391,83 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     MAX_CARDS_PER_SPREAD,
                 )
                 if not claim["allowed"]:
+                    if attempt_id:
+                        await record_analytics_event(
+                            event_type="card_rejected_limit",
+                            idempotency_key=f"telegram:attempt:{attempt_id}:card_rejected_limit",
+                            spread_id=spread_id,
+                            card_position=position,
+                            actor_hash=_actor_hash(update.effective_user.id),
+                            metadata={"attempt_id": attempt_id},
+                        )
                     await update.message.reply_text(
                         "Вы уже открыли две карты в этом раскладе. Третью открыть нельзя."
                     )
                     return
                 if not claim["is_new"]:
+                    if attempt_id:
+                        await record_analytics_event(
+                            event_type="card_rejected_duplicate",
+                            idempotency_key=f"telegram:attempt:{attempt_id}:card_rejected_duplicate",
+                            spread_id=spread_id,
+                            card_position=position,
+                            actor_hash=_actor_hash(update.effective_user.id),
+                            metadata={"attempt_id": attempt_id},
+                        )
                     await update.message.reply_text(
                         "Эту карту вы уже открывали в этом раскладе."
                     )
                     return
 
                 card_id = spread["card_ids"][position - 1]
-                await send_card_to_chat(
-                    context.bot,
-                    update.effective_chat.id,
-                    card_id,
-                    spread_id,
-                    position,
-                )
-                await record_analytics_event(
-                    event_type="card_opened",
-                    idempotency_key=f"telegram:update:{update.update_id}:card_opened",
-                    spread_id=spread_id,
-                    card_id=card_id,
-                    card_position=position,
-                    actor_hash=_actor_hash(update.effective_user.id),
-                )
+                try:
+                    await send_card_to_chat(
+                        context.bot,
+                        update.effective_chat.id,
+                        card_id,
+                        spread_id,
+                        position,
+                    )
+                    await record_analytics_event(
+                        event_type="card_opened",
+                        idempotency_key=f"telegram:update:{update.update_id}:card_opened",
+                        spread_id=spread_id,
+                        card_id=card_id,
+                        card_position=position,
+                        actor_hash=_actor_hash(update.effective_user.id),
+                    )
+                    if attempt_id:
+                        await record_analytics_event(
+                            event_type="card_delivery_succeeded",
+                            idempotency_key=f"telegram:attempt:{attempt_id}:card_delivery_succeeded",
+                            spread_id=spread_id,
+                            card_id=card_id,
+                            card_position=position,
+                            actor_hash=_actor_hash(update.effective_user.id),
+                            metadata={"attempt_id": attempt_id},
+                        )
+                except Exception as exc:
+                    await asyncio.to_thread(
+                        db.release_spread_selection,
+                        spread_id,
+                        update.effective_user.id,
+                        position,
+                    )
+                    await record_analytics_event(
+                        event_type="card_delivery_failed",
+                        idempotency_key=f"telegram:update:{update.update_id}:card_delivery_failed",
+                        spread_id=spread_id,
+                        card_id=card_id,
+                        card_position=position,
+                        actor_hash=_actor_hash(update.effective_user.id),
+                        metadata=(
+                            {"attempt_id": attempt_id} if attempt_id else None
+                        ),
+                    )
+                    logger.exception("Could not send selected card from start link", exc_info=exc)
+                    await update.message.reply_text(
+                        "Не удалось отправить карту. Нажмите её номер ещё раз."
+                    )
                 return
 
     if is_admin(update):
