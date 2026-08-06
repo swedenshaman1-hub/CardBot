@@ -52,6 +52,69 @@ class SpreadSelectionTests(unittest.TestCase):
         result = db.claim_spread_selection(11, 100, 3)
         self.assertTrue(result["allowed"] and result["is_new"])
 
+    def test_failed_delivery_releases_reserved_choice(self):
+        db.claim_spread_selection(10, 100, 2)
+        self.assertTrue(db.release_spread_selection(10, 100, 2))
+        self.assertEqual(db.get_spread_selections(10, 100), [])
+        retry = db.claim_spread_selection(10, 100, 2)
+        self.assertTrue(retry["allowed"] and retry["is_new"])
+
+
+class CardDeliveryAnalyticsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_callback_delivery_failure_releases_choice_and_records_reason(self):
+        query = SimpleNamespace(
+            data="pick:42:1",
+            from_user=SimpleNamespace(id=55),
+            answer=AsyncMock(),
+        )
+        update = SimpleNamespace(callback_query=query, update_id=9001)
+        context = SimpleNamespace(
+            bot=SimpleNamespace(send_chat_action=AsyncMock()),
+        )
+        spread = {"id": 42, "card_ids": [3, 4, 5, 6, 7, 8]}
+
+        with (
+            patch.object(bot.db, "get_spread", return_value=spread),
+            patch.object(bot, "require_channel_subscription", new=AsyncMock(return_value=(True, None))),
+            patch.object(
+                bot.db,
+                "claim_spread_selection",
+                return_value={"allowed": True, "is_new": True, "selections": [1]},
+            ),
+            patch.object(bot.db, "release_spread_selection", return_value=True) as release,
+            patch.object(bot, "send_card_to_chat", new=AsyncMock(side_effect=RuntimeError("send failed"))),
+            patch.object(bot, "record_analytics_event", new=AsyncMock()) as record,
+        ):
+            await bot.select_card_callback(update, context)
+
+        release.assert_called_once_with(42, 55, 1)
+        event_types = [call.kwargs["event_type"] for call in record.await_args_list]
+        self.assertIn("card_button_clicked", event_types)
+        self.assertIn("card_delivery_failed", event_types)
+        self.assertNotIn("card_delivery_succeeded", event_types)
+
+    def test_attempt_summary_prefers_eventual_delivery_after_start_redirect(self):
+        rows = [
+            {
+                "event_type": "card_button_clicked",
+                "actor_hash": "actor",
+                "metadata": {"attempt_id": "100"},
+            },
+            {
+                "event_type": "card_rejected_bot_not_started",
+                "actor_hash": "actor",
+                "metadata": {"attempt_id": "100"},
+            },
+            {
+                "event_type": "card_delivery_succeeded",
+                "actor_hash": "actor",
+                "metadata": {"attempt_id": "100"},
+            },
+        ]
+        summary = db._summarise_events(rows)
+        self.assertEqual(summary["tracked_button_attempts"], 1)
+        self.assertEqual(summary["button_outcome_counts"], {"delivered": 1})
+
 
 class MembershipTests(unittest.TestCase):
     def test_active_members_are_allowed(self):

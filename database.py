@@ -13,6 +13,12 @@ CARD_EVENT_TYPES = {
     "spread_published",
     "card_button_clicked",
     "card_opened",
+    "card_delivery_succeeded",
+    "card_rejected_subscription",
+    "card_rejected_bot_not_started",
+    "card_rejected_duplicate",
+    "card_rejected_limit",
+    "card_delivery_failed",
     "voice_requested",
     "voice_sent",
     "reaction_added",
@@ -382,6 +388,50 @@ def _summarise_events(rows: list[dict]) -> dict:
         actor_openings.setdefault(row["actor_hash"], set()).add(
             (row.get("spread_id"), row.get("card_position"))
         )
+    button_attempt_ids = {
+        str(row.get("metadata", {}).get("attempt_id"))
+        for row in rows
+        if row["event_type"] == "card_button_clicked"
+        and row.get("metadata", {}).get("attempt_id") is not None
+    }
+    legacy_button_clicks = sum(
+        1
+        for row in rows
+        if row["event_type"] == "card_button_clicked"
+        and row.get("metadata", {}).get("attempt_id") is None
+    )
+    outcomes_by_attempt: dict[str, set[str]] = {}
+    tracked_outcome_types = {
+        "card_delivery_succeeded",
+        "card_rejected_subscription",
+        "card_rejected_bot_not_started",
+        "card_rejected_duplicate",
+        "card_rejected_limit",
+        "card_delivery_failed",
+    }
+    for row in rows:
+        attempt_id = row.get("metadata", {}).get("attempt_id")
+        if attempt_id is None or row["event_type"] not in tracked_outcome_types:
+            continue
+        outcomes_by_attempt.setdefault(str(attempt_id), set()).add(row["event_type"])
+
+    button_outcomes = Counter()
+    for attempt_id in button_attempt_ids:
+        outcomes = outcomes_by_attempt.get(attempt_id, set())
+        if "card_delivery_succeeded" in outcomes:
+            button_outcomes["delivered"] += 1
+        elif "card_delivery_failed" in outcomes:
+            button_outcomes["delivery_failed"] += 1
+        elif "card_rejected_limit" in outcomes:
+            button_outcomes["limit"] += 1
+        elif "card_rejected_duplicate" in outcomes:
+            button_outcomes["duplicate"] += 1
+        elif "card_rejected_subscription" in outcomes:
+            button_outcomes["subscription"] += 1
+        elif "card_rejected_bot_not_started" in outcomes:
+            button_outcomes["waiting_for_start"] += 1
+        else:
+            button_outcomes["unclassified"] += 1
     return {
         "events_total": len(rows),
         "event_counts": dict(event_counts),
@@ -399,6 +449,9 @@ def _summarise_events(rows: list[dict]) -> dict:
         "users_opened_two_or_more": sum(
             len(values) >= 2 for values in actor_openings.values()
         ),
+        "button_outcome_counts": dict(button_outcomes),
+        "tracked_button_attempts": len(button_attempt_ids),
+        "legacy_button_clicks": legacy_button_clicks,
     }
 
 
@@ -456,6 +509,23 @@ def claim_spread_selection(
         json.dumps(selections, separators=(",", ":")),
     )
     return {"allowed": True, "is_new": True, "selections": selections}
+
+
+def release_spread_selection(spread_id: int, user_id: int, position: int) -> bool:
+    """Release a reserved choice after card delivery failed.
+
+    Returns True when the position was present and removed.  A failed delivery
+    must not consume one of the user's two choices for the spread.
+    """
+    selections = get_spread_selections(spread_id, user_id)
+    if position not in selections:
+        return False
+    selections.remove(position)
+    set_setting(
+        _spread_selection_key(spread_id, user_id),
+        json.dumps(selections, separators=(",", ":")),
+    )
+    return True
 
 
 def get_card_back_url() -> str | None:
