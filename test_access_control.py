@@ -232,6 +232,38 @@ class SpreadPublicationTests(unittest.IsolatedAsyncioTestCase):
             self.telegram.send_photo.await_args.kwargs["caption"],
         )
 
+    async def test_failed_previous_post_deletion_is_reported(self):
+        self.telegram.delete_message.side_effect = bot.BadRequest(
+            "Message can't be deleted"
+        )
+        previous = {
+            "id": 41,
+            "channel_message_id": 401,
+            "card_ids": [1, 2, 3, 4, 5, 6],
+            "question": None,
+        }
+        with (
+            patch.object(bot.db, "get_card_back_url", return_value=None),
+            patch.object(bot.db, "get_spread_engagement", return_value={}),
+            patch.object(bot, "build_collage", return_value=self.collage_path),
+            patch.object(bot.db, "set_setting"),
+            patch.object(bot.db, "get_setting", return_value=None),
+            patch.object(bot.db, "get_published_spreads", return_value=[previous]),
+            patch.object(bot.db, "update_spread_message"),
+            patch.object(bot, "record_analytics_event", new=AsyncMock()),
+            patch.object(bot, "schedule_spread_deletion", new=MagicMock()),
+            patch.object(bot, "notify_reminder_subscribers", new=AsyncMock()),
+        ):
+            warnings = await bot.publish_spread_to_channel(
+                self.application, 42, self.spread, "voice-file-id"
+            )
+
+        self.assertEqual(warnings, [41])
+
+    def test_auto_delete_stays_inside_telegram_limit(self):
+        self.assertEqual(bot.AUTO_DELETE_SECONDS, 47 * 60 * 60)
+        self.assertLess(bot.AUTO_DELETE_SECONDS, 48 * 60 * 60)
+
 
 class SpreadQuestionCaptionTests(unittest.TestCase):
     def test_spread_without_question_keeps_exact_caption(self):

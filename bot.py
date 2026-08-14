@@ -54,7 +54,9 @@ REFLECTION_PROMPT_VERSION = "v2"
 SPREAD_QUESTION_PROMPT_VERSION = "v1"
 SPREAD_QUESTION_MAX_LENGTH = 70
 TELEGRAM_CAPTION_MAX_LENGTH = 1024
-AUTO_DELETE_SECONDS = 72 * 60 * 60
+# Telegram only allows bots to delete messages younger than 48 hours.
+# Keep a one-hour safety margin for scheduler and network delays.
+AUTO_DELETE_SECONDS = 47 * 60 * 60
 AUTO_DELETE_SETTING_PREFIX = "spread_auto_delete:"
 SPREAD_INTRO_SETTING_PREFIX = "spread_intro:"
 SPREAD_VOICE_SCRIPT_PREFIX = "spread_voice_script:"
@@ -1657,6 +1659,7 @@ async def publish_spread_to_channel(
     voice_file_id: str,
 ):
     """Publish the shared photo-and-voice channel sequence for one spread."""
+    deletion_warnings: set[int] = set()
     engagement = await asyncio.to_thread(db.get_spread_engagement, spread_id)
     back_url = await asyncio.to_thread(db.get_card_back_url)
     collage_path = await asyncio.to_thread(build_collage, back_url, spread_id)
@@ -1712,6 +1715,7 @@ async def publish_spread_to_channel(
                     message_id=int(previous_voice_id),
                 )
             except (TelegramError, ValueError) as exc:
+                deletion_warnings.add(previous_spread["id"])
                 logger.warning(
                     "Could not delete previous author voice for spread %s: %s",
                     previous_spread["id"],
@@ -1744,12 +1748,14 @@ async def publish_spread_to_channel(
                     previous_spread["id"],
                 )
             else:
+                deletion_warnings.add(previous_spread["id"])
                 logger.warning(
                     "Could not delete previous spread %s: %s",
                     previous_spread["id"],
                     exc,
                 )
         except TelegramError as exc:
+            deletion_warnings.add(previous_spread["id"])
             logger.warning(
                 "Could not delete previous spread %s: %s",
                 previous_spread["id"],
@@ -1792,6 +1798,7 @@ async def publish_spread_to_channel(
         application, spread_id, message.message_id, delete_at
     )
     asyncio.create_task(notify_reminder_subscribers(application, spread_id))
+    return sorted(deletion_warnings)
 
 
 async def publish_scheduled_spread(
@@ -1810,18 +1817,25 @@ async def publish_scheduled_spread(
     if not voice_file_id:
         raise RuntimeError(f"Spread #{spread_id} has no author voice")
 
-    await publish_spread_to_channel(
+    deletion_warnings = await publish_spread_to_channel(
         application, spread_id, spread, voice_file_id
     )
     await asyncio.to_thread(
         db.set_setting, _scheduled_spread_key(spread_id), "published"
     )
     if admin_chat_id:
+        warning = ""
+        if deletion_warnings:
+            warning = (
+                "\n\n⚠️ Telegram не позволил удалить прежний расклад "
+                f"№{', №'.join(map(str, deletion_warnings))}. Скорее всего, "
+                "ему больше 48 часов — удалите его в канале вручную."
+            )
         await application.bot.send_message(
             chat_id=admin_chat_id,
             text=(
                 f"✅ Запланированный расклад #{spread_id} опубликован "
-                "в канале."
+                f"в канале. Новый пост будет удалён через 47 часов.{warning}"
             ),
         )
 
@@ -2083,7 +2097,7 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     try:
-        await publish_spread_to_channel(
+        deletion_warnings = await publish_spread_to_channel(
             context.application,
             spread_id,
             spread,
@@ -2123,7 +2137,17 @@ async def publish_spread_callback(update: Update, context: ContextTypes.DEFAULT_
         pass
     await context.bot.send_message(
         chat_id=query.message.chat_id,
-        text=f"✅ Расклад #{spread_id} опубликован в канале. Бот удалит этот пост через 72 часа.",
+        text=(
+            f"✅ Расклад #{spread_id} опубликован в канале. "
+            "Бот удалит этот пост через 47 часов."
+            + (
+                "\n\n⚠️ Telegram не позволил удалить прежний расклад "
+                f"№{', №'.join(map(str, deletion_warnings))}. Скорее всего, "
+                "ему больше 48 часов — удалите его в канале вручную."
+                if deletion_warnings
+                else ""
+            )
+        ),
     )
 
 
