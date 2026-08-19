@@ -14,6 +14,14 @@ os.environ.setdefault("GEMINI_API_KEY", "test-key")
 
 import bot
 import database as db
+import dmitry_voice
+
+
+VALID_DMITRY_SCRIPT = """Сначала почувствуй, потом решай
+
+Иногда голова торопится всё объяснить и заранее разложить по местам. А тело уже знает, где вам спокойно, а где внутри появляется напряжение. Не обязательно спорить с собой или немедленно искать правильный ответ. Можно просто заметить эту разницу и немного побыть рядом с ней.
+
+Что меняется, когда вы не подгоняете себя? Сегодня попробуйте оставить немного пространства между первым импульсом и решением. Иногда именно в этой короткой паузе становится слышно то, что действительно важно."""
 
 
 class SpreadSelectionTests(unittest.TestCase):
@@ -138,6 +146,58 @@ class MembershipTests(unittest.TestCase):
                 SimpleNamespace(status="restricted", is_member=False)
             )
         )
+
+
+class DmitryVoiceProfileTests(unittest.TestCase):
+    def test_profile_is_versioned_and_contains_brand_boundaries(self):
+        self.assertEqual(dmitry_voice.DMITRY_VOICE_PROFILE_VERSION, "v1")
+        profile = dmitry_voice.DMITRY_VOICE_PROFILE.lower()
+        self.assertIn("простая разговорная речь", profile)
+        self.assertIn("не называть дмитрия терапевтом", profile)
+        self.assertIn("не упоминать карты", profile)
+
+    def test_validator_accepts_natural_spoken_structure(self):
+        self.assertEqual(dmitry_voice.validate_voice_script(VALID_DMITRY_SCRIPT), [])
+
+    def test_validator_rejects_cards_and_healing_claims(self):
+        invalid = VALID_DMITRY_SCRIPT.replace(
+            "Иногда голова",
+            "Эта карта принесёт исцеление, и жизнь обязательно изменится. Иногда голова",
+        )
+        errors = dmitry_voice.validate_voice_script(invalid)
+        self.assertIn("упоминание карт", errors)
+        self.assertIn("обещание исцеления", errors)
+        self.assertIn("ложная гарантия", errors)
+
+    def test_generator_uses_draft_and_editor_with_lower_variance(self):
+        draft = VALID_DMITRY_SCRIPT.replace("важно", "по-настоящему важно")
+        responses = [SimpleNamespace(text=draft), SimpleNamespace(text=VALID_DMITRY_SCRIPT)]
+        generate = MagicMock(side_effect=responses)
+        client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+        cards = [{"id": index, "meaning": f"Смысл {index}"} for index in range(1, 7)]
+
+        with patch.object(bot.genai, "Client", return_value=client):
+            result = bot._generate_spread_voice_script(cards, [])
+
+        self.assertEqual(result, VALID_DMITRY_SCRIPT)
+        self.assertEqual(generate.call_count, 2)
+        first, second = generate.call_args_list
+        self.assertIn(dmitry_voice.DMITRY_VOICE_PROFILE, first.kwargs["contents"])
+        self.assertIn(dmitry_voice.DMITRY_VOICE_PROFILE, second.kwargs["contents"])
+        self.assertEqual(first.kwargs["config"].temperature, 0.72)
+        self.assertEqual(second.kwargs["config"].temperature, 0.35)
+
+    def test_generator_falls_back_to_valid_draft_when_editor_fails(self):
+        generate = MagicMock(
+            side_effect=[SimpleNamespace(text=VALID_DMITRY_SCRIPT), RuntimeError("editor down")]
+        )
+        client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+        cards = [{"id": index, "meaning": f"Смысл {index}"} for index in range(1, 7)]
+
+        with patch.object(bot.genai, "Client", return_value=client):
+            result = bot._generate_spread_voice_script(cards, [])
+
+        self.assertEqual(result, VALID_DMITRY_SCRIPT)
 
 
 class SpreadPublicationTests(unittest.IsolatedAsyncioTestCase):
