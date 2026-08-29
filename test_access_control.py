@@ -206,6 +206,65 @@ class DmitryVoiceProfileTests(unittest.TestCase):
 
         self.assertEqual(result, VALID_DMITRY_SCRIPT)
 
+    def test_generator_repairs_non_blocking_format_errors(self):
+        malformed = VALID_DMITRY_SCRIPT.replace("\n\n", "\n").replace(
+            "себя?", "себя? А что ты выберешь?"
+        )
+        repaired = VALID_DMITRY_SCRIPT
+        generate = MagicMock(
+            side_effect=[
+                SimpleNamespace(text=malformed),
+                SimpleNamespace(text=malformed),
+                SimpleNamespace(text=repaired),
+            ]
+        )
+        client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+        cards = [{"id": index, "meaning": f"Смысл {index}"} for index in range(1, 7)]
+
+        with patch.object(bot.genai, "Client", return_value=client):
+            result = bot._generate_spread_voice_script(cards, [])
+
+        self.assertEqual(result, repaired)
+        self.assertEqual(generate.call_count, 3)
+        self.assertIn("нарушения формата", generate.call_args_list[2].kwargs["contents"])
+
+    def test_generator_keeps_safe_text_when_only_layout_remains_invalid(self):
+        malformed = VALID_DMITRY_SCRIPT.replace("\n\n", "\n").replace(
+            "себя?", "себя? А что ты выберешь?"
+        )
+        generate = MagicMock(
+            side_effect=[SimpleNamespace(text=malformed)] * 3
+        )
+        client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+        cards = [{"id": index, "meaning": f"Смысл {index}"} for index in range(1, 7)]
+
+        with patch.object(bot.genai, "Client", return_value=client):
+            result = bot._generate_spread_voice_script(cards, [])
+
+        self.assertEqual(result, malformed)
+
+    def test_generator_never_falls_back_to_unsafe_positioning(self):
+        unsafe = VALID_DMITRY_SCRIPT.replace(
+            "Иногда голова", "Как целитель я вижу: у тебя родовая программа. Иногда голова"
+        ).replace("\n\n", "\n")
+        generate = MagicMock(side_effect=[SimpleNamespace(text=unsafe)] * 3)
+        client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+        cards = [{"id": index, "meaning": f"Смысл {index}"} for index in range(1, 7)]
+
+        with patch.object(bot.genai, "Client", return_value=client):
+            with self.assertRaises(RuntimeError):
+                bot._generate_spread_voice_script(cards, [])
+
+    def test_generator_does_not_accept_arbitrary_length_as_cosmetic(self):
+        too_short = "Слишком короткий текст без нужного смысла"
+        generate = MagicMock(side_effect=[SimpleNamespace(text=too_short)] * 3)
+        client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+        cards = [{"id": index, "meaning": f"Смысл {index}"} for index in range(1, 7)]
+
+        with patch.object(bot.genai, "Client", return_value=client):
+            with self.assertRaises(RuntimeError):
+                bot._generate_spread_voice_script(cards, [])
+
 
 class SpreadPublicationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
