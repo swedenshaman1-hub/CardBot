@@ -17,6 +17,12 @@ from urllib.parse import quote
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
+from dmitry_voice import (
+    DMITRY_VOICE_PROFILE,
+    DMITRY_VOICE_PROFILE_VERSION,
+    normalize_voice_script,
+    validate_voice_script,
+)
 from telegram import (
     BotCommand,
     BotCommandScopeChat,
@@ -351,83 +357,92 @@ def _generate_spread_voice_script(
         http_options=genai_types.HttpOptions(timeout=60_000),
     )
     card_context = "\n".join(
-        f"- Карта №{card['id']}: {card.get('meaning', '').strip()[:1100]}"
-        for card in cards
+        f"- Источник смысла {index}: {card.get('meaning', '').strip()[:900]}"
+        for index, card in enumerate(cards, start=1)
     )
-    recent_context = "\n\n---\n\n".join(recent_scripts[-7:]) or "Нет предыдущих текстов."
-    prompt = f"""
-Ты создаёшь личное голосовое вступление Дмитрия к ежедневному раскладу
-«Карты дня». Дмитрий прочитает этот текст своим голосом.
+    recent_context = "\n\n---\n\n".join(recent_scripts[-5:]) or "Нет предыдущих текстов."
+    draft_prompt = f"""
+Создай короткий сценарий, который Дмитрий сможет естественно произнести вслух.
+Это самостоятельное человеческое размышление; слушателю не объясняют источник темы.
 
-Значения шести карт используй только как скрытый источник темы и глубины.
-Готовое послание должно звучать как самостоятельное человеческое размышление.
-В нём нельзя упоминать карты, расклад, номера, выбор карты или объяснять,
-откуда появилась тема. Человек должен услышать цельную мысль, полезную саму
-по себе, даже если слушает аудио отдельно от публикации.
+Сначала внутренне определи одну центральную мысль, к которой приводят источники.
+Не показывай этот разбор в ответе. Собери текст по логике:
+узнаваемая жизненная ситуация → привычное объяснение → простой новый угол →
+одно наблюдение, которое человек сможет проверить сегодня → спокойный финал.
 
-Перед финальным ответом молча проведи текст через редакционную команду:
-1. Методолог «Терапии Души» — карта не предсказывает будущее, а возвращает
-   внимание к телу, чувствам, мыслям, авторству и внутренней опоре.
-2. Редактор голоса Дмитрия — сердечность, живое присутствие, простота,
-   уверенность, отсутствие осуждения и разговора сверху.
-3. Joanna Wiebe — сильный, ясный хук на языке реального переживания человека.
-4. Ann Handley — человеческая интонация, конкретность и ощущение разговора
-   с одним человеком, а не с безликой аудиторией.
-5. Rory Sutherland — свежий смысловой угол без искажения значений карт.
-6. Cialdini и Sandel — этическая проверка: никакого давления, страха,
-   искусственного дефицита, манипуляции болью и ложных обещаний.
+ПРОФИЛЬ ГОЛОСА {DMITRY_VOICE_PROFILE_VERSION}:
+{DMITRY_VOICE_PROFILE}
 
-Формат обязателен:
-- первая строка — короткий цепляющий заголовок-хук из 4–8 слов;
-- затем пустая строка и связный текст;
-- весь текст 75–95 слов: это 30–40 секунд спокойной речи;
-- 3 коротких абзаца;
-- один точный вопрос, который помогает человеку прислушаться к себе;
-- финал — спокойная завершающая мысль или приглашение понаблюдать за собой
-  в течение дня, без призыва выбирать карту.
+Формат:
+- 70–90 слов;
+- первая строка — разговорный хук из 3–8 слов без конечного знака;
+- затем пустая строка и 2–3 коротких абзаца;
+- одна цельная мысль, не более одного вопроса, спокойный финал;
+- текст должен легко произноситься с первого прочтения;
+- используй обычные слова и конкретные жизненные наблюдения;
+- глубина создаётся точностью смысла, а не сложной лексикой;
+- не добавляй рекламный призыв и не проси подписаться, сохранить или поставить реакцию;
+- только готовый текст, без Markdown, кавычек и пояснений.
 
-Голос Дмитрия: живой, тёплый, уверенный, сердечный, без пафоса. Должно
-чувствоваться, что он лично выбрал карты и сейчас говорит с одним человеком.
-Найди общий смысловой нерв шести карт и преврати его в самостоятельное
-рассуждение, не выдавая источник темы.
-
-Запрещено: любые слова «карта», «карты», «расклад», «выберите», предсказания,
-диагнозы, давление, обещания результата, мистический
-туман, «Вселенная посылает знак», «это неслучайно», канцелярит и рекламные штампы.
-Не повторяй заголовки, вопросы, начало и образ из недавних текстов.
-Выдай только готовый текст. Не ставь кавычки, Markdown и пояснения.
-
-Сегодняшние карты:
+Скрытые источники смысла:
 {card_context}
 
-Недавние сценарии, которые нельзя повторять:
+Недавние сценарии — не повторяй их начало, вопрос, главный образ и вывод:
 {recent_context}
 """.strip()
+    draft_response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=draft_prompt,
+        config=genai_types.GenerateContentConfig(
+            temperature=0.72,
+            max_output_tokens=900,
+            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+        ),
+    )
+    draft = normalize_voice_script(draft_response.text or "")
 
-    last_text = ""
-    for _ in range(3):
-        response = client.models.generate_content(
+    editor_prompt = f"""
+Отредактируй черновик для живой устной речи Дмитрия.
+
+ПРОФИЛЬ ГОЛОСА {DMITRY_VOICE_PROFILE_VERSION}:
+{DMITRY_VOICE_PROFILE}
+
+Проверка:
+- сохрани исходный смысл и не добавляй новых фактов;
+- убери пафос, абстрактный эзотерический туман, канцелярит, сложные слова и ломаные переходы;
+- если фразу нельзя легко понять на слух с первого раза, перепиши её проще;
+- оставь одну узнаваемую ситуацию, один новый взгляд и одну небольшую пользу;
+- сделай фразы разговорными и удобными для произнесения;
+- 70–90 слов, хук отдельной первой строкой, затем 2–3 абзаца;
+- не более одного вопроса, спокойное завершение;
+- не упоминай источник темы;
+- верни только итоговый текст без Markdown и пояснений.
+
+ЧЕРНОВИК:
+{draft}
+""".strip()
+    try:
+        edited_response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=prompt,
+            contents=editor_prompt,
             config=genai_types.GenerateContentConfig(
-                temperature=1.05,
-                max_output_tokens=1200,
+                temperature=0.35,
+                max_output_tokens=900,
                 thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
             ),
         )
-        last_text = (response.text or "").strip().strip('"')
-        last_text = last_text.replace("*", "").replace("`", "").replace("_", "")
-        word_count = len(last_text.split())
-        if 65 <= word_count <= 110 and "\n" in last_text:
-            return last_text
-        prompt += (
-            f"\n\nПредыдущая попытка содержала {word_count} слов. "
-            "Перепиши полностью и строго соблюди объём 75–95 слов."
-        )
+        edited = normalize_voice_script(edited_response.text or "")
+        if not validate_voice_script(edited):
+            return edited
+    except Exception as exc:
+        logger.warning("Voice script editorial pass failed: %s", exc)
 
-    if len(last_text.split()) < 50:
-        raise RuntimeError("Gemini returned a voice script that is too short")
-    return last_text
+    draft_errors = validate_voice_script(draft)
+    if not draft_errors:
+        return draft
+    raise RuntimeError(
+        "Gemini returned an invalid voice script: " + "; ".join(draft_errors)
+    )
 
 
 def _generate_reflection_question(card: dict) -> str:
