@@ -20,6 +20,7 @@ from google.genai import types as genai_types
 from dmitry_voice import (
     DMITRY_VOICE_PROFILE,
     DMITRY_VOICE_PROFILE_VERSION,
+    VOICE_SCRIPT_BLOCKING_ERRORS,
     normalize_voice_script,
     validate_voice_script,
 )
@@ -432,14 +433,77 @@ def _generate_spread_voice_script(
             ),
         )
         edited = normalize_voice_script(edited_response.text or "")
-        if not validate_voice_script(edited):
+        edited_errors = validate_voice_script(edited)
+        if not edited_errors:
             return edited
     except Exception as exc:
         logger.warning("Voice script editorial pass failed: %s", exc)
+        edited = ""
+        edited_errors = []
 
     draft_errors = validate_voice_script(draft)
     if not draft_errors:
         return draft
+
+    # A final narrow repair is used only when both generated versions missed
+    # mechanical format requirements. It does not invent a new message.
+    repair_source = edited or draft
+    repair_errors = edited_errors or draft_errors
+    repair_prompt = f"""
+Исправь только перечисленные нарушения формата в готовом тексте:
+{'; '.join(repair_errors)}.
+
+Сохрани одну мысль, смысл, простой разговорный язык и все факты исходного текста.
+Оставь не более одного вопроса. Первая строка — хук без конечного знака,
+после неё пустая строка и 2–3 коротких абзаца. Объём 70–90 слов.
+Верни только исправленный текст без Markdown и пояснений.
+
+ТЕКСТ:
+{repair_source}
+""".strip()
+    try:
+        repaired_response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=repair_prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.15,
+                max_output_tokens=900,
+                thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        repaired = normalize_voice_script(repaired_response.text or "")
+        repaired_errors = validate_voice_script(repaired)
+        if not repaired_errors:
+            return repaired
+    except Exception as exc:
+        logger.warning("Voice script format repair failed: %s", exc)
+        repaired = ""
+        repaired_errors = []
+
+    # Do not make the admin workflow fail because of paragraph count, an extra
+    # question mark or a small length deviation. Unsafe semantic violations
+    # remain blocking.
+    candidates = [
+        (text, errors)
+        for text, errors in (
+            (repaired, repaired_errors),
+            (edited, edited_errors),
+            (draft, draft_errors),
+        )
+        if text
+    ]
+    safe_candidates = [
+        (text, errors)
+        for text, errors in candidates
+        if not VOICE_SCRIPT_BLOCKING_ERRORS.intersection(errors)
+    ]
+    if safe_candidates:
+        best_text, best_errors = min(safe_candidates, key=lambda item: len(item[1]))
+        logger.warning(
+            "Using safe voice script with non-blocking editorial issues: %s",
+            "; ".join(best_errors),
+        )
+        return best_text
     raise RuntimeError(
         "Gemini returned an invalid voice script: " + "; ".join(draft_errors)
     )

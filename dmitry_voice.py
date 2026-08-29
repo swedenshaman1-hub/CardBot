@@ -65,6 +65,11 @@ _FORBIDDEN_PATTERNS = {
     "ложная гарантия": r"\b(?:гарантир\w*|обязательно\s+(?:изменится|получится|сбудется))\b",
 }
 
+# These violations must never reach the administrator as a suggested script.
+# Layout and length issues can be reviewed manually, but unsafe positioning or
+# mystical promises must keep blocking the result.
+VOICE_SCRIPT_BLOCKING_ERRORS = frozenset(_FORBIDDEN_PATTERNS)
+
 
 def normalize_voice_script(text: str) -> str:
     """Remove model formatting while preserving natural paragraph breaks."""
