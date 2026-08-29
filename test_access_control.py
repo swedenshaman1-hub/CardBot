@@ -150,9 +150,12 @@ class MembershipTests(unittest.TestCase):
 
 class DmitryVoiceProfileTests(unittest.TestCase):
     def test_profile_is_versioned_and_contains_brand_boundaries(self):
-        self.assertEqual(dmitry_voice.DMITRY_VOICE_PROFILE_VERSION, "v1")
+        self.assertEqual(dmitry_voice.DMITRY_VOICE_PROFILE_VERSION, "v2")
         profile = dmitry_voice.DMITRY_VOICE_PROFILE.lower()
         self.assertIn("простая разговорная речь", profile)
+        self.assertIn("одну ясную мысль", profile)
+        self.assertIn("это про меня", profile)
+        self.assertIn("не рекламный ролик", profile)
         self.assertIn("не называть дмитрия терапевтом", profile)
         self.assertIn("не упоминать карты", profile)
 
@@ -183,7 +186,11 @@ class DmitryVoiceProfileTests(unittest.TestCase):
         self.assertEqual(generate.call_count, 2)
         first, second = generate.call_args_list
         self.assertIn(dmitry_voice.DMITRY_VOICE_PROFILE, first.kwargs["contents"])
+        self.assertIn("узнаваемая жизненная ситуация", first.kwargs["contents"])
+        self.assertIn("простой новый угол", first.kwargs["contents"])
+        self.assertIn("проверить сегодня", first.kwargs["contents"])
         self.assertIn(dmitry_voice.DMITRY_VOICE_PROFILE, second.kwargs["contents"])
+        self.assertIn("перепиши её проще", second.kwargs["contents"])
         self.assertEqual(first.kwargs["config"].temperature, 0.72)
         self.assertEqual(second.kwargs["config"].temperature, 0.35)
 
