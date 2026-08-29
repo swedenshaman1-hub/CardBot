@@ -243,6 +243,28 @@ class DmitryVoiceProfileTests(unittest.TestCase):
 
         self.assertEqual(result, malformed)
 
+    def test_generator_never_falls_back_to_unsafe_positioning(self):
+        unsafe = VALID_DMITRY_SCRIPT.replace(
+            "Иногда голова", "Как целитель я вижу: у тебя родовая программа. Иногда голова"
+        ).replace("\n\n", "\n")
+        generate = MagicMock(side_effect=[SimpleNamespace(text=unsafe)] * 3)
+        client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+        cards = [{"id": index, "meaning": f"Смысл {index}"} for index in range(1, 7)]
+
+        with patch.object(bot.genai, "Client", return_value=client):
+            with self.assertRaises(RuntimeError):
+                bot._generate_spread_voice_script(cards, [])
+
+    def test_generator_does_not_accept_arbitrary_length_as_cosmetic(self):
+        too_short = "Слишком короткий текст без нужного смысла"
+        generate = MagicMock(side_effect=[SimpleNamespace(text=too_short)] * 3)
+        client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+        cards = [{"id": index, "meaning": f"Смысл {index}"} for index in range(1, 7)]
+
+        with patch.object(bot.genai, "Client", return_value=client):
+            with self.assertRaises(RuntimeError):
+                bot._generate_spread_voice_script(cards, [])
+
 
 class SpreadPublicationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

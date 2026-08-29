@@ -21,6 +21,7 @@ from dmitry_voice import (
     DMITRY_VOICE_PROFILE,
     DMITRY_VOICE_PROFILE_VERSION,
     VOICE_SCRIPT_BLOCKING_ERRORS,
+    VOICE_SCRIPT_RECOVERABLE_ERRORS,
     normalize_voice_script,
     validate_voice_script,
 )
@@ -496,6 +497,7 @@ def _generate_spread_voice_script(
         (text, errors)
         for text, errors in candidates
         if not VOICE_SCRIPT_BLOCKING_ERRORS.intersection(errors)
+        and set(errors).issubset(VOICE_SCRIPT_RECOVERABLE_ERRORS)
     ]
     if safe_candidates:
         best_text, best_errors = min(safe_candidates, key=lambda item: len(item[1]))
