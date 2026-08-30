@@ -66,6 +66,8 @@ AUTO_DELETE_SECONDS = 72 * 60 * 60
 AUTO_DELETE_SETTING_PREFIX = "spread_auto_delete:"
 SPREAD_INTRO_SETTING_PREFIX = "spread_intro:"
 SPREAD_VOICE_SCRIPT_PREFIX = "spread_voice_script:"
+SPREAD_VOICE_SCRIPT_VERSION_PREFIX = "spread_voice_script_version:"
+SPREAD_VOICE_PROMPT_VERSION = "v3"
 SPREAD_VOICE_SETTING_PREFIX = "spread_voice:"
 SPREAD_CHANNEL_VOICE_PREFIX = "spread_channel_voice:"
 SCHEDULED_SPREAD_PREFIX = "scheduled_spread:"
@@ -282,6 +284,10 @@ def _spread_voice_script_key(spread_id: int) -> str:
     return f"{SPREAD_VOICE_SCRIPT_PREFIX}{spread_id:010d}"
 
 
+def _spread_voice_script_version_key(spread_id: int) -> str:
+    return f"{SPREAD_VOICE_SCRIPT_VERSION_PREFIX}{spread_id:010d}"
+
+
 def _spread_channel_voice_key(spread_id: int) -> str:
     return f"{SPREAD_CHANNEL_VOICE_PREFIX}{spread_id:010d}"
 
@@ -351,7 +357,7 @@ def _generate_spread_intro(cards: list[dict], recent_intros: list[str]) -> str:
 
 
 def _generate_spread_voice_script(
-    cards: list[dict], recent_scripts: list[str]
+    cards: list[dict], recent_scripts: list[str], spread_id: int = 0
 ) -> str:
     """Create a 30–40 second personal script for Dmitry to record."""
     client = genai.Client(
@@ -363,6 +369,15 @@ def _generate_spread_voice_script(
         for index, card in enumerate(cards, start=1)
     )
     recent_context = "\n\n---\n\n".join(recent_scripts[-5:]) or "Нет предыдущих текстов."
+    narrative_modes = (
+        "бытовое наблюдение из обычной жизни без поучения",
+        "короткое личное размышление от первого лица: «я замечаю / мне кажется»",
+        "один ясный парадокс, который меняет привычный взгляд",
+        "маленькая сцена между людьми или внутренний диалог",
+        "конкретное наблюдение за телом, словами или поступком без медитации",
+        "спокойное несогласие с распространённым объяснением",
+    )
+    narrative_mode = narrative_modes[spread_id % len(narrative_modes)]
     draft_prompt = f"""
 Создай короткий сценарий, который Дмитрий сможет естественно произнести вслух.
 Это самостоятельное человеческое размышление; слушателю не объясняют источник темы.
@@ -371,6 +386,14 @@ def _generate_spread_voice_script(
 Не показывай этот разбор в ответе. Собери текст по логике:
 узнаваемая жизненная ситуация → привычное объяснение → простой новый угол →
 одно наблюдение, которое человек сможет проверить сегодня → спокойный финал.
+
+ФОРМА ИМЕННО ЭТОГО ВАРИАНТА:
+{narrative_mode}.
+
+Это обязательное отличие от недавних сценариев. Не используй их центральную тему,
+конфликт, образ, хук, финальный вопрос или вывод, даже если заменил бы слова
+синонимами. Если выбранная мысль похожа на контроль, отпускание прошлого,
+«быть собой» или «открыться новому», выбери другой конкретный смысл из источников.
 
 ПРОФИЛЬ ГОЛОСА {DMITRY_VOICE_PROFILE_VERSION}:
 {DMITRY_VOICE_PROFILE}
@@ -384,6 +407,9 @@ def _generate_spread_voice_script(
 - используй обычные слова и конкретные жизненные наблюдения;
 - глубина создаётся точностью смысла, а не сложной лексикой;
 - не добавляй рекламный призыв и не проси подписаться, сохранить или поставить реакцию;
+- запрещённые шаблоны: «Привет, замечал», «Привет, знаешь», «Иногда мы»,
+  «истинная сила», «истинная свобода», «Что сегодня ты выбираешь»,
+  «Позволь этому дню», «Прислушайся к себе»;
 - только готовый текст, без Markdown, кавычек и пояснений.
 
 Скрытые источники смысла:
@@ -414,6 +440,9 @@ def _generate_spread_voice_script(
 - убери пафос, абстрактный эзотерический туман, канцелярит, сложные слова и ломаные переходы;
 - если фразу нельзя легко понять на слух с первого раза, перепиши её проще;
 - оставь одну узнаваемую ситуацию, один новый взгляд и одну небольшую пользу;
+- сравни с недавними сценариями и убери повтор их темы, конфликта, хука и финала;
+- не используй шаблоны «Привет, замечал/знаешь», «Что сегодня ты выбираешь»,
+  «Позволь этому дню» и «Прислушайся к себе»;
 - сделай фразы разговорными и удобными для произнесения;
 - 70–90 слов, хук отдельной первой строкой, затем 2–3 абзаца;
 - не более одного вопроса, спокойное завершение;
@@ -422,6 +451,9 @@ def _generate_spread_voice_script(
 
 ЧЕРНОВИК:
 {draft}
+
+НЕДАВНИЕ СЦЕНАРИИ, КОТОРЫЕ НЕЛЬЗЯ ПОВТОРЯТЬ ПО СМЫСЛУ И СТРУКТУРЕ:
+{recent_context}
 """.strip()
     try:
         edited_response = client.models.generate_content(
@@ -916,6 +948,17 @@ def recorded_voice_preview_keyboard(spread_id: int) -> InlineKeyboardMarkup:
                 "🔁 Перезаписать",
                 callback_data=f"record-spread:{spread_id}",
             ),
+        ]
+    ])
+
+
+def voice_script_actions_keyboard(spread_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔄 Другой вариант текста",
+                callback_data=f"regenerate-spread:{spread_id}",
+            )
         ]
     ])
 
@@ -1607,6 +1650,7 @@ async def record_spread_voice_callback(
     if query is None or not query.data or not is_admin(update):
         return
 
+    force_regenerate = query.data.startswith("regenerate-spread:")
     try:
         spread_id = int(query.data.split(":", 1)[1])
     except (IndexError, ValueError):
@@ -1622,7 +1666,15 @@ async def record_spread_voice_callback(
     script = await asyncio.to_thread(
         db.get_setting, _spread_voice_script_key(spread_id)
     )
-    if not script:
+    script_version = await asyncio.to_thread(
+        db.get_setting, _spread_voice_script_version_key(spread_id)
+    )
+    should_generate = (
+        force_regenerate
+        or not script
+        or script_version != SPREAD_VOICE_PROMPT_VERSION
+    )
+    if should_generate:
         cards, missing = await asyncio.to_thread(
             db.get_cards, spread["card_ids"]
         )
@@ -1640,6 +1692,7 @@ async def record_spread_voice_callback(
                 _generate_spread_voice_script,
                 cards,
                 recent_scripts,
+                spread_id,
             )
         except Exception as exc:
             logger.exception("Could not generate author voice script", exc_info=exc)
@@ -1653,6 +1706,13 @@ async def record_spread_voice_callback(
             _spread_voice_script_key(spread_id),
             script,
         )
+        await asyncio.to_thread(
+            db.set_setting,
+            _spread_voice_script_version_key(spread_id),
+            SPREAD_VOICE_PROMPT_VERSION,
+        )
+        if force_regenerate or script_version != SPREAD_VOICE_PROMPT_VERSION:
+            await asyncio.to_thread(db.delete_setting, _spread_voice_key(spread_id))
 
     context.user_data.pop("pending_card_reflection", None)
     context.user_data.pop("pending_reflection_test", None)
@@ -1665,10 +1725,12 @@ async def record_spread_voice_callback(
         text=(
             "🎙 <b>Текст для вашего голосового послания:</b>\n\n"
             f"<b>{hook}</b>\n\n{body}\n\n"
+            f"<i>Система текста: {SPREAD_VOICE_PROMPT_VERSION}</i>\n\n"
             "<b>Теперь запишите и отправьте сюда голосовое сообщение.</b>\n"
             "Можно читать не дословно — главное сохранить этот смысл и говорить от себя."
         ),
         parse_mode="HTML",
+        reply_markup=voice_script_actions_keyboard(spread_id),
     )
 
 
@@ -4000,7 +4062,7 @@ def main():
     application.add_handler(
         CallbackQueryHandler(
             record_spread_voice_callback,
-            pattern=r"^record-spread:",
+            pattern=r"^(record|regenerate)-spread:",
         )
     )
     application.add_handler(

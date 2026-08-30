@@ -150,7 +150,7 @@ class MembershipTests(unittest.TestCase):
 
 class DmitryVoiceProfileTests(unittest.TestCase):
     def test_profile_is_versioned_and_contains_brand_boundaries(self):
-        self.assertEqual(dmitry_voice.DMITRY_VOICE_PROFILE_VERSION, "v2")
+        self.assertEqual(dmitry_voice.DMITRY_VOICE_PROFILE_VERSION, "v3")
         profile = dmitry_voice.DMITRY_VOICE_PROFILE.lower()
         self.assertIn("простая разговорная речь", profile)
         self.assertIn("одну ясную мысль", profile)
@@ -189,6 +189,8 @@ class DmitryVoiceProfileTests(unittest.TestCase):
         self.assertIn("узнаваемая жизненная ситуация", first.kwargs["contents"])
         self.assertIn("простой новый угол", first.kwargs["contents"])
         self.assertIn("проверить сегодня", first.kwargs["contents"])
+        self.assertIn("Привет, замечал", first.kwargs["contents"])
+        self.assertIn("нельзя повторять по смыслу", second.kwargs["contents"].lower())
         self.assertIn(dmitry_voice.DMITRY_VOICE_PROFILE, second.kwargs["contents"])
         self.assertIn("перепиши её проще", second.kwargs["contents"])
         self.assertEqual(first.kwargs["config"].temperature, 0.72)
@@ -242,6 +244,34 @@ class DmitryVoiceProfileTests(unittest.TestCase):
             result = bot._generate_spread_voice_script(cards, [])
 
         self.assertEqual(result, malformed)
+
+    def test_generator_rotates_narrative_mode_by_spread(self):
+        generate = MagicMock(return_value=SimpleNamespace(text=VALID_DMITRY_SCRIPT))
+        client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+        cards = [{"id": index, "meaning": f"Смысл {index}"} for index in range(1, 7)]
+
+        with patch.object(bot.genai, "Client", return_value=client):
+            bot._generate_spread_voice_script(cards, [], spread_id=1)
+            first_prompt = generate.call_args_list[0].kwargs["contents"]
+            generate.reset_mock()
+            bot._generate_spread_voice_script(cards, [], spread_id=2)
+            second_prompt = generate.call_args_list[0].kwargs["contents"]
+
+        self.assertIn("личное размышление от первого лица", first_prompt)
+        self.assertIn("один ясный парадокс", second_prompt)
+
+    def test_voice_script_cache_key_has_separate_prompt_version(self):
+        self.assertNotEqual(
+            bot._spread_voice_script_key(42),
+            bot._spread_voice_script_version_key(42),
+        )
+        self.assertEqual(bot.SPREAD_VOICE_PROMPT_VERSION, "v3")
+
+    def test_voice_script_actions_offer_explicit_regeneration(self):
+        keyboard = bot.voice_script_actions_keyboard(42)
+        button = keyboard.inline_keyboard[0][0]
+        self.assertEqual(button.text, "🔄 Другой вариант текста")
+        self.assertEqual(button.callback_data, "regenerate-spread:42")
 
     def test_generator_never_falls_back_to_unsafe_positioning(self):
         unsafe = VALID_DMITRY_SCRIPT.replace(
