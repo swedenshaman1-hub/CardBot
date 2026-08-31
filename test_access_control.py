@@ -172,9 +172,45 @@ class DmitryVoiceProfileTests(unittest.TestCase):
         self.assertIn("обещание исцеления", errors)
         self.assertIn("ложная гарантия", errors)
 
+    def test_validator_rejects_legacy_voice_templates(self):
+        templated = VALID_DMITRY_SCRIPT.replace(
+            "Иногда голова", "Привет, замечал, как иногда голова"
+        ).replace("важно", "истинная сила важна")
+        errors = dmitry_voice.validate_voice_script(templated)
+        self.assertIn("шаблонное начало", errors)
+        self.assertIn("шаблонная глубина", errors)
+
+    def test_novelty_validator_rejects_recent_duplicate(self):
+        self.assertEqual(
+            dmitry_voice.validate_voice_script_novelty(
+                VALID_DMITRY_SCRIPT, [VALID_DMITRY_SCRIPT]
+            ),
+            ["дословно повторяет недавний сценарий"],
+        )
+
+    def test_novelty_validator_accepts_distinct_script(self):
+        distinct = (
+            "Обычный разговор за ужином\n\n"
+            "Два человека могут говорить об одном и слышать совершенно разное. "
+            "Один ждёт решения, другой хочет, чтобы его просто услышали. Из-за этого "
+            "даже заботливые слова иногда звучат как давление.\n\n"
+            "Можно не искать виноватого, а на минуту остановиться и уточнить, чего "
+            "сейчас ждёт близкий человек. Такой простой вопрос часто возвращает в "
+            "разговор больше тепла, чем самый правильный совет."
+        )
+        self.assertEqual(
+            dmitry_voice.validate_voice_script_novelty(
+                distinct, [VALID_DMITRY_SCRIPT]
+            ),
+            [],
+        )
+
     def test_generator_uses_draft_and_editor_with_lower_variance(self):
         draft = VALID_DMITRY_SCRIPT.replace("важно", "по-настоящему важно")
-        responses = [SimpleNamespace(text=draft), SimpleNamespace(text=VALID_DMITRY_SCRIPT)]
+        responses = [
+            SimpleNamespace(text=draft),
+            SimpleNamespace(text="NOVELTY PASS\n" + VALID_DMITRY_SCRIPT),
+        ]
         generate = MagicMock(side_effect=responses)
         client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
         cards = [{"id": index, "meaning": f"Смысл {index}"} for index in range(1, 7)]
@@ -241,7 +277,7 @@ class DmitryVoiceProfileTests(unittest.TestCase):
             side_effect=[
                 SimpleNamespace(text=malformed),
                 SimpleNamespace(text=malformed),
-                SimpleNamespace(text=repaired),
+                SimpleNamespace(text="NOVELTY PASS\n" + repaired),
             ]
         )
         client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
@@ -252,14 +288,18 @@ class DmitryVoiceProfileTests(unittest.TestCase):
 
         self.assertEqual(result, repaired)
         self.assertEqual(generate.call_count, 3)
-        self.assertIn("нарушения формата", generate.call_args_list[2].kwargs["contents"])
+        self.assertIn("перечисленные нарушения", generate.call_args_list[2].kwargs["contents"])
 
     def test_generator_keeps_safe_text_when_only_layout_remains_invalid(self):
         malformed = VALID_DMITRY_SCRIPT.replace("\n\n", "\n").replace(
             "себя?", "себя? А что ты выберешь?"
         )
         generate = MagicMock(
-            side_effect=[SimpleNamespace(text=malformed)] * 3
+            side_effect=[
+                SimpleNamespace(text=malformed),
+                SimpleNamespace(text="NOVELTY PASS\n" + malformed),
+                SimpleNamespace(text="NOVELTY PASS\n" + malformed),
+            ]
         )
         client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
         cards = [{"id": index, "meaning": f"Смысл {index}"} for index in range(1, 7)]
@@ -301,7 +341,13 @@ class DmitryVoiceProfileTests(unittest.TestCase):
         unsafe = VALID_DMITRY_SCRIPT.replace(
             "Иногда голова", "Как целитель я вижу: у тебя родовая программа. Иногда голова"
         ).replace("\n\n", "\n")
-        generate = MagicMock(side_effect=[SimpleNamespace(text=unsafe)] * 3)
+        generate = MagicMock(
+            side_effect=[
+                SimpleNamespace(text=unsafe),
+                SimpleNamespace(text="NOVELTY PASS\n" + unsafe),
+                SimpleNamespace(text="NOVELTY PASS\n" + unsafe),
+            ]
+        )
         client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
         cards = [{"id": index, "meaning": f"Смысл {index}"} for index in range(1, 7)]
 
@@ -311,7 +357,13 @@ class DmitryVoiceProfileTests(unittest.TestCase):
 
     def test_generator_does_not_accept_arbitrary_length_as_cosmetic(self):
         too_short = "Слишком короткий текст без нужного смысла"
-        generate = MagicMock(side_effect=[SimpleNamespace(text=too_short)] * 3)
+        generate = MagicMock(
+            side_effect=[
+                SimpleNamespace(text=too_short),
+                SimpleNamespace(text="NOVELTY PASS\n" + too_short),
+                SimpleNamespace(text="NOVELTY PASS\n" + too_short),
+            ]
+        )
         client = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
         cards = [{"id": index, "meaning": f"Смысл {index}"} for index in range(1, 7)]
 

@@ -24,6 +24,7 @@ from dmitry_voice import (
     VOICE_SCRIPT_RECOVERABLE_ERRORS,
     normalize_voice_script,
     validate_voice_script,
+    validate_voice_script_novelty,
 )
 from telegram import (
     BotCommand,
@@ -383,6 +384,18 @@ def _generate_spread_voice_script(
         )
         or "Нет предыдущих текстов."
     )
+
+    def script_errors(text: str) -> list[str]:
+        return validate_voice_script(text) + validate_voice_script_novelty(
+            text, recent_scripts
+        )
+
+    def reviewed_script(response_text: str) -> str:
+        normalized = normalize_voice_script(response_text)
+        first_line, separator, remainder = normalized.partition("\n")
+        if first_line.strip() != "NOVELTY PASS" or not separator:
+            return ""
+        return normalize_voice_script(remainder)
     narrative_modes = (
         "бытовое наблюдение из обычной жизни без поучения",
         "короткое личное размышление от первого лица: «я замечаю / мне кажется»",
@@ -464,7 +477,10 @@ def _generate_spread_voice_script(
 - 70–90 слов, хук отдельной первой строкой, затем 2–3 абзаца;
 - не более одного вопроса, спокойное завершение;
 - не упоминай источник темы;
-- верни только итоговый текст без Markdown и пояснений.
+- сначала сравни итоговую центральную мысль, конфликт, хук и финал с недавними
+  сценариями. Если они похожи по смыслу, перепиши текст на другой смысл из источников;
+- первая строка ответа должна быть ровно NOVELTY PASS, затем готовый текст;
+- не добавляй других пояснений и Markdown.
 
 <draft_data>
 {escape(draft, quote=False)}
@@ -485,8 +501,10 @@ def _generate_spread_voice_script(
                 thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
             ),
         )
-        edited = normalize_voice_script(edited_response.text or "")
-        edited_errors = validate_voice_script(edited)
+        edited = reviewed_script(edited_response.text or "")
+        if not edited:
+            raise RuntimeError("Gemini editor did not confirm semantic novelty")
+        edited_errors = script_errors(edited)
         if not edited_errors:
             return edited
     except Exception as exc:
@@ -494,7 +512,7 @@ def _generate_spread_voice_script(
         edited = ""
         edited_errors = []
 
-    draft_errors = validate_voice_script(draft)
+    draft_errors = script_errors(draft)
     if not draft_errors:
         return draft
 
@@ -503,17 +521,29 @@ def _generate_spread_voice_script(
     repair_source = edited or draft
     repair_errors = edited_errors or draft_errors
     repair_prompt = f"""
-Исправь только перечисленные нарушения формата в готовом тексте:
+Исправь перечисленные нарушения в готовом тексте:
 {'; '.join(repair_errors)}.
 
 Сохрани одну мысль, смысл, простой разговорный язык и все факты исходного текста.
+Если текст повторяет недавний сценарий или шаблон, выбери другой конкретный смысл
+из источников и полностью замени хук, конфликт, образ и финал.
 Оставь не более одного вопроса. Первая строка — хук без конечного знака,
 после неё пустая строка и 2–3 коротких абзаца. Объём 70–90 слов.
-Верни только исправленный текст без Markdown и пояснений.
+Сравни центральную мысль, конфликт, хук и финал с недавними сценариями.
+Первая строка ответа должна быть ровно NOVELTY PASS, затем исправленный текст.
+Не добавляй других пояснений и Markdown.
 
 <draft_data>
 {escape(repair_source, quote=False)}
 </draft_data>
+
+<source_data>
+{card_context}
+</source_data>
+
+<recent_data>
+{recent_context}
+</recent_data>
 """.strip()
     try:
         repaired_response = client.models.generate_content(
@@ -526,8 +556,10 @@ def _generate_spread_voice_script(
                 thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
             ),
         )
-        repaired = normalize_voice_script(repaired_response.text or "")
-        repaired_errors = validate_voice_script(repaired)
+        repaired = reviewed_script(repaired_response.text or "")
+        if not repaired:
+            raise RuntimeError("Gemini repair did not confirm semantic novelty")
+        repaired_errors = script_errors(repaired)
         if not repaired_errors:
             return repaired
     except Exception as exc:
