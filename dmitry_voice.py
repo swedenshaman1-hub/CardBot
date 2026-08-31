@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
+from difflib import SequenceMatcher
 
 
-DMITRY_VOICE_PROFILE_VERSION = "v2"
+DMITRY_VOICE_PROFILE_VERSION = "v3"
 
 DMITRY_VOICE_PROFILE = """
 Говори как Дмитрий в живом разговоре с одним человеком.
@@ -49,6 +50,9 @@ DMITRY_VOICE_PROFILE = """
 - не использовать эзотерический туман, знаки Вселенной и мистическую неизбежность;
 - не использовать без конкретного смысла слова «глубина», «пространство»,
   «истинный», «трансформация», «ресурс», «путь» и «проявленность»;
+- не начинать словами «Привет, замечал», «Привет, знаешь» или «Иногда мы»;
+- не строить финал по шаблону «Что сегодня ты выбираешь»;
+- не заканчивать фразами «Позволь этому дню» и «Прислушайся к себе»;
 - не злоупотреблять словами «блин», «башка», «головастики» и религиозным пафосом;
 - не упоминать карты, расклад, номера, выбор карты или источник темы.
 """.strip()
@@ -72,6 +76,13 @@ _FORBIDDEN_PATTERNS = {
         r"исследовани\w*\s+(?:доказал\w*|подтвержда\w*))\b"
     ),
     "ложная гарантия": r"\b(?:гарантир\w*|обязательно\s+(?:изменится|получится|сбудется))\b",
+}
+
+_REPETITIVE_PATTERNS = {
+    "шаблонное начало": r"\b(?:привет[,!]?[ ]*)?(?:замечал|знаешь)[,!]?[ ]+как\b|\bиногда\s+мы\b",
+    "шаблонный выбор": r"\bчто\s+сегодня\s+ты\s+выбираешь\b",
+    "шаблонный финал": r"\b(?:позволь\s+этому\s+дню|прислушайся\s+к\s+себе)\b",
+    "шаблонная глубина": r"\bистинн(?:ая|ую)\s+(?:сила|свобода|глубина)\b",
 }
 
 # These violations must never reach the administrator as a suggested script.
@@ -130,4 +141,32 @@ def validate_voice_script(text: str) -> list[str]:
     for label, pattern in _FORBIDDEN_PATTERNS.items():
         if re.search(pattern, lowered, flags=re.IGNORECASE):
             errors.append(label)
+    for label, pattern in _REPETITIVE_PATTERNS.items():
+        if re.search(pattern, lowered, flags=re.IGNORECASE):
+            errors.append(label)
     return errors
+
+
+def _comparison_text(text: str) -> str:
+    return " ".join(
+        re.findall(r"[0-9a-zа-яё]+", normalize_voice_script(text).lower())
+    )
+
+
+def validate_voice_script_novelty(text: str, recent_scripts: list[str]) -> list[str]:
+    """Reject literal and almost literal repeats; semantic review is done by Gemini."""
+    candidate = _comparison_text(text)
+    if not candidate:
+        return ["пустой текст для проверки новизны"]
+
+    for recent in recent_scripts:
+        previous = _comparison_text(recent)
+        if not previous:
+            continue
+        if candidate == previous:
+            return ["дословно повторяет недавний сценарий"]
+
+        sequence_ratio = SequenceMatcher(None, candidate, previous).ratio()
+        if sequence_ratio >= 0.90:
+            return ["слишком похож на недавний сценарий"]
+    return []
